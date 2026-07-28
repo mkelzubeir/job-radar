@@ -98,33 +98,49 @@ const PROFILE_SYSTEM = [
   "technologies/methods, not soft skills.",
 ].join("\n");
 
+// Error that carries the HTTP status so the UI can map it to friendly copy.
+// `status` is undefined for network/CORS failures (fetch itself rejected).
+function apiError(status, message) {
+  const e = new Error(message);
+  e.status = status;
+  return e;
+}
+
 async function callClaude(apiKey, system, userMsg, maxTokens = 1500) {
-  const res = await fetch(API_URL, {
-    method: "POST",
-    headers: {
-      "content-type": "application/json",
-      "x-api-key": apiKey,
-      "anthropic-version": "2023-06-01",
-      "anthropic-dangerous-direct-browser-access": "true",
-    },
-    body: JSON.stringify({
-      model: MODEL,
-      max_tokens: maxTokens,
-      thinking: { type: "disabled" },
-      system,
-      messages: [{ role: "user", content: userMsg }],
-    }),
-  });
+  let res;
+  try {
+    res = await fetch(API_URL, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-api-key": apiKey,
+        "anthropic-version": "2023-06-01",
+        "anthropic-dangerous-direct-browser-access": "true",
+      },
+      body: JSON.stringify({
+        model: MODEL,
+        max_tokens: maxTokens,
+        thinking: { type: "disabled" },
+        system,
+        messages: [{ role: "user", content: userMsg }],
+      }),
+    });
+  } catch (netErr) {
+    // fetch() rejects on network failure or a blocked CORS request — no status.
+    throw apiError(undefined, netErr?.message || "Network request failed");
+  }
+
   if (!res.ok) {
-    let detail = String(res.status);
+    let detail = "";
     try {
       const err = await res.json();
-      detail = err?.error?.message || detail;
+      detail = err?.error?.message || "";
     } catch {
       /* non-JSON error body */
     }
-    throw new Error(`Anthropic API ${detail}`);
+    throw apiError(res.status, detail || `HTTP ${res.status}`);
   }
+
   const data = await res.json();
   return (data.content || [])
     .filter((b) => b.type === "text")

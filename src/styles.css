@@ -85,8 +85,19 @@ header { border-bottom: 1px solid var(--line); padding: 28px 0 22px; }
 .chip:hover { border-color: var(--signal); }
 /* AI-extracted keyword chips — visually distinct from local n-gram chips */
 .chip-ai { border-color: var(--signal); color: var(--signal); background: var(--pin); }
-.analyze-btn { width: 100%; margin-top: 8px; }
+.analyze-btn { width: 100%; margin-top: 8px; display: inline-flex; align-items: center; justify-content: center; gap: 7px; }
+.analyze-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+.analyze-hint { color: var(--ink-soft); }
 .profile-line { color: var(--ink); font-style: italic; }
+
+/* inline spinner for in-flight AI calls */
+.spinner {
+  width: 12px; height: 12px; border-radius: 50%;
+  border: 2px solid currentColor; border-top-color: transparent;
+  display: inline-block; animation: spin 0.7s linear infinite;
+}
+@keyframes spin { to { transform: rotate(360deg); } }
+@media (prefers-reduced-motion: reduce) { .spinner { animation: none; } }
 
 /* company list */
 .co-search {

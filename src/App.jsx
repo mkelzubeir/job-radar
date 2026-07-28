@@ -44,6 +44,17 @@ const save = (k, value) => {
 
 const coKey = (c) => `${c.ats}:${c.slug}`.toLowerCase();
 
+// Map an Anthropic API failure to short, human-readable copy. Errors thrown by
+// src/lib/ai.js carry `.status` (undefined for network/CORS failures).
+const humanizeAiError = (e) => {
+  const s = e?.status;
+  if (s === 401) return "401 · Invalid API key";
+  if (s === 429) return "429 · Rate limited, try again shortly";
+  if (s === 400) return `400 · ${e.message || "Bad request"}`;
+  if (s) return `${s} · ${e.message || "Request failed"}`;
+  return "Request blocked — check the browser console (network/CORS)";
+};
+
 // Merge the current seed into the user's stored list when the seed version has
 // advanced: dedupe by ats:slug (case-insensitive), keep user-added entries, and
 // append any missing seed entries. NOTE: a user who deleted a seed company will
@@ -142,11 +153,16 @@ export default function App() {
 
   // Turn the résumé into a structured profile (primary path when a key exists).
   async function runProfile(text) {
-    if (!aiKey.trim() || !text) return;
+    const key = aiKey.trim();
+    if (!key) {
+      setProfileErr("Enter your Anthropic API key below first.");
+      return;
+    }
+    if (!text) return;
     setProfileBusy(true);
     setProfileErr(null);
     try {
-      const p = await extractProfile(text, aiKey.trim());
+      const p = await extractProfile(text, key);
       setProfile(p);
       const kws = [
         ...p.skills.map((s) => ({ term: s.term, weight: s.weight })),
@@ -160,7 +176,8 @@ export default function App() {
         setTargetTitles(p.titles.join(", "));
       }
     } catch (e) {
-      setProfileErr(e.message);
+      console.error("Analyze with AI failed:", e); // surface CORS/network detail
+      setProfileErr(humanizeAiError(e));
     } finally {
       setProfileBusy(false);
     }
@@ -368,7 +385,8 @@ export default function App() {
       setAiScores(scores);
       setAiWarnings(warnings);
     } catch (e) {
-      setAiError(e.message);
+      console.error("Smart rank failed:", e);
+      setAiError(humanizeAiError(e));
     } finally {
       setAiBusy(false);
     }
@@ -421,18 +439,29 @@ export default function App() {
                 {resumeName ? `↻ ${resumeName}` : "Upload PDF or TXT"}
               </button>
               {resumeText && (
-                <button
-                  className="wl-btn analyze-btn"
-                  onClick={() => runProfile(resumeText)}
-                  disabled={!aiKey.trim() || profileBusy}
-                  title={aiKey.trim() ? "" : "Add an API key in Smart rank first"}
-                >
-                  {profileBusy
-                    ? "Analyzing…"
-                    : profile
-                    ? "↻ Re-analyze with AI"
-                    : "Analyze with AI"}
-                </button>
+                <>
+                  <button
+                    className="wl-btn analyze-btn"
+                    onClick={() => runProfile(resumeText)}
+                    disabled={!aiKey.trim() || profileBusy}
+                    title={aiKey.trim() ? "" : "Enter your Anthropic API key below first"}
+                  >
+                    {profileBusy ? (
+                      <>
+                        <span className="spinner" aria-hidden="true" /> Analyzing…
+                      </>
+                    ) : profile ? (
+                      "↻ Re-analyze with AI"
+                    ) : (
+                      "Analyze with AI"
+                    )}
+                  </button>
+                  {!aiKey.trim() && (
+                    <p className="hint analyze-hint">
+                      Enter your Anthropic API key below (§4 · Smart rank) first.
+                    </p>
+                  )}
+                </>
               )}
               <p className="hint">
                 Parsed locally with pdf.js. With an API key, "Analyze with AI"
