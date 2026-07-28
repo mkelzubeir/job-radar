@@ -2,15 +2,21 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { ADAPTERS, scanCompanies } from "./lib/ats";
 import { extractResumeText, extractKeywords } from "./lib/resume";
 import { rankJobs } from "./lib/match";
-import { aiRerank } from "./lib/ai";
+import { semanticRank, clearAiCache } from "./lib/ai";
 import seedCompanies from "./data/companies.json";
 
 const LS = {
   companies: "jobradar.companies",
   keywords: "jobradar.keywords",
   titles: "jobradar.titles",
-  resume: "jobradar.resume",
+  resumeText: "jobradar.resumeText",
+  seedVersion: "jobradar.seedVersion",
+  candidates: "jobradar.candidateCount",
 };
+
+// Bump when companies.json changes so returning users get new seed entries.
+const SEED_VERSION = 2;
+
 const load = (k, fallback) => {
   try {
     const v = localStorage.getItem(k);
@@ -19,6 +25,33 @@ const load = (k, fallback) => {
     return fallback;
   }
 };
+
+const coKey = (c) => `${c.ats}:${c.slug}`.toLowerCase();
+
+// Merge the current seed into the user's stored list when the seed version has
+// advanced: dedupe by ats:slug (case-insensitive), keep user-added entries, and
+// append any missing seed entries. NOTE: a user who deleted a seed company will
+// see it resurface on a version bump — acceptable tradeoff for delivering updates.
+function loadCompanies() {
+  const stored = load(LS.companies, null);
+  if (!stored) {
+    localStorage.setItem(LS.seedVersion, JSON.stringify(SEED_VERSION));
+    return seedCompanies;
+  }
+  const storedVersion = load(LS.seedVersion, 0);
+  if (storedVersion >= SEED_VERSION) return stored;
+
+  const seen = new Set(stored.map(coKey));
+  const merged = [...stored];
+  for (const c of seedCompanies) {
+    if (!seen.has(coKey(c))) {
+      merged.push(c);
+      seen.add(coKey(c));
+    }
+  }
+  localStorage.setItem(LS.seedVersion, JSON.stringify(SEED_VERSION));
+  return merged;
+}
 
 const timeAgo = (iso) => {
   if (!iso) return "";
@@ -31,10 +64,10 @@ const timeAgo = (iso) => {
 };
 
 export default function App() {
-  const [companies, setCompanies] = useState(() => load(LS.companies, seedCompanies));
+  const [companies, setCompanies] = useState(loadCompanies);
   const [keywords, setKeywords] = useState(() => load(LS.keywords, []));
   const [targetTitles, setTargetTitles] = useState(() => load(LS.titles, ""));
-  const [resumeText, setResumeText] = useState(() => load(LS.resume, ""));
+  const [resumeText, setResumeText] = useState(() => load(LS.resumeText, ""));
   const [resumeName, setResumeName] = useState("");
   const [jobs, setJobs] = useState([]);
   const [errors, setErrors] = useState([]);
@@ -42,11 +75,14 @@ export default function App() {
   const [progress, setProgress] = useState([0, 0]);
   const [scannedAt, setScannedAt] = useState(null);
 
-  // AI re-rank (key kept only in state, never persisted)
+  // Smart rank (Stage 2). The API key lives ONLY in state — never persisted.
   const [aiKey, setAiKey] = useState("");
+  const [candidateCount, setCandidateCount] = useState(() => load(LS.candidates, 60));
   const [aiScores, setAiScores] = useState(() => new Map());
   const [aiBusy, setAiBusy] = useState(false);
+  const [aiProgress, setAiProgress] = useState([0, 0]);
   const [aiError, setAiError] = useState(null);
+  const [aiWarnings, setAiWarnings] = useState([]);
 
   // Filters
   const [q, setQ] = useState("");
@@ -63,7 +99,8 @@ export default function App() {
   useEffect(() => localStorage.setItem(LS.companies, JSON.stringify(companies)), [companies]);
   useEffect(() => localStorage.setItem(LS.keywords, JSON.stringify(keywords)), [keywords]);
   useEffect(() => localStorage.setItem(LS.titles, JSON.stringify(targetTitles)), [targetTitles]);
-  useEffect(() => localStorage.setItem(LS.resume, JSON.stringify(resumeText)), [resumeText]);
+  useEffect(() => localStorage.setItem(LS.resumeText, JSON.stringify(resumeText)), [resumeText]);
+  useEffect(() => localStorage.setItem(LS.candidates, JSON.stringify(candidateCount)), [candidateCount]);
 
   async function onResume(file) {
     if (!file) return;
@@ -91,21 +128,25 @@ export default function App() {
   }
 
   const titlesArr = targetTitles.split(",").map((s) => s.trim()).filter(Boolean);
+
+  // Stage 1 (retrieval): TF-IDF over the whole scan.
   const ranked = useMemo(
     () => rankJobs(jobs, keywords, titlesArr),
     [jobs, keywords, targetTitles] // eslint-disable-line react-hooks/exhaustive-deps
   );
 
-  const hasAi = aiScores.size > 0;
   const withAi = useMemo(
-    () => ranked.map((j) => ({ ...j, ai: aiScores.get(j.id) || null })),
+    () => ranked.map((j) => ({ ...j, ai: aiScores.get(String(j.id)) || null })),
     [ranked, aiScores]
   );
+
+  // The primary score is the AI score when present, else the keyword match.
+  const primaryScore = (j) => (j.ai ? j.ai.score : j.match);
 
   const visible = withAi.filter((j) => {
     if (remoteOnly && !j.remote) return false;
     if (compOnly && !j.comp) return false;
-    if (j.match < minMatch) return false;
+    if (primaryScore(j) < minMatch) return false; // filter on whichever score is primary
     if (q) {
       const hay = `${j.company} ${j.title} ${j.location}`.toLowerCase();
       if (!hay.includes(q.toLowerCase())) return false;
@@ -113,14 +154,15 @@ export default function App() {
     return true;
   });
 
-  // When AI scores are present, sort by AI score (jobs the AI ranked first).
-  const shown = hasAi
-    ? [...visible].sort((a, b) => {
-        const sa = a.ai ? a.ai.score : -1;
-        const sb = b.ai ? b.ai.score : -1;
-        return sb - sa || b.match - a.match;
-      })
-    : visible;
+  // AI-scored jobs first (by AI score), then unscored jobs by keyword match.
+  const shown = [...visible].sort((a, b) => {
+    if (!!a.ai !== !!b.ai) return a.ai ? -1 : 1;
+    if (a.ai && b.ai) return b.ai.score - a.ai.score || b.match - a.match;
+    return (
+      b.match - a.match ||
+      (b.postedAt || "").localeCompare(a.postedAt || "")
+    );
+  });
 
   const removeKeyword = (term) => setKeywords(keywords.filter((k) => k.term !== term));
   const addCompany = () => {
@@ -164,23 +206,45 @@ export default function App() {
     }
   }
 
-  async function runAiRerank() {
+  function restoreDefaults() {
+    if (!confirm("Reset your watchlist to the bundled default list? Any companies you added will be removed.")) {
+      return;
+    }
+    setCompanies(seedCompanies);
+    localStorage.setItem(LS.seedVersion, JSON.stringify(SEED_VERSION));
+  }
+
+  async function runSmartRank() {
     if (!aiKey.trim() || !resumeText.trim() || !ranked.length || aiBusy) return;
     setAiBusy(true);
     setAiError(null);
+    setAiWarnings([]);
+    setAiProgress([0, 0]);
     try {
-      const scores = await aiRerank({
-        apiKey: aiKey.trim(),
+      const candidates = ranked.slice(0, candidateCount);
+      const { scores, warnings } = await semanticRank(
         resumeText,
-        jobs: ranked,
-      });
+        candidates,
+        aiKey.trim(),
+        { onProgress: (d, t) => setAiProgress([d, t]) }
+      );
       setAiScores(scores);
+      setAiWarnings(warnings);
     } catch (e) {
       setAiError(e.message);
     } finally {
       setAiBusy(false);
     }
   }
+
+  function clearSmartRank() {
+    clearAiCache();
+    setAiScores(new Map());
+    setAiWarnings([]);
+    setAiError(null);
+  }
+
+  const hasScores = keywords.length + titlesArr.length > 0;
 
   return (
     <>
@@ -219,7 +283,8 @@ export default function App() {
                 {resumeName ? `↻ ${resumeName}` : "Upload PDF or TXT"}
               </button>
               <p className="hint">
-                Parsed locally with pdf.js — your resume never leaves this device.
+                Parsed locally with pdf.js — your resume stays on this device unless
+                you use Smart rank (see below).
               </p>
               {keywords.length > 0 && (
                 <div className="chips">
@@ -314,12 +379,15 @@ export default function App() {
                 <button className="wl-btn" onClick={() => importRef.current.click()}>
                   ↑ Import
                 </button>
+                <button className="wl-btn" onClick={restoreDefaults}>
+                  ↺ Restore default list
+                </button>
               </div>
             </section>
 
-            {/* AI re-rank */}
+            {/* Smart rank */}
             <section className="card">
-              <h3>4 · AI re-rank (optional)</h3>
+              <h3>4 · Smart rank</h3>
               <input
                 type="password"
                 value={aiKey}
@@ -327,18 +395,42 @@ export default function App() {
                 placeholder="sk-ant-… Anthropic API key"
                 autoComplete="off"
               />
+              <label className="sr-slider">
+                <span>Candidates: {candidateCount}</span>
+                <input
+                  type="range"
+                  min="20"
+                  max="150"
+                  step="10"
+                  value={candidateCount}
+                  onChange={(e) => setCandidateCount(+e.target.value)}
+                />
+              </label>
               <button
                 className="ai-btn"
-                onClick={runAiRerank}
+                onClick={runSmartRank}
                 disabled={aiBusy || !aiKey.trim() || !resumeText || !ranked.length}
               >
-                {aiBusy ? "Re-ranking…" : "Re-rank top 30 with Claude"}
+                {aiBusy
+                  ? `Ranking… ${aiProgress[0]}/${aiProgress[1]}`
+                  : `Smart rank top ${Math.min(candidateCount, ranked.length || candidateCount)}`}
               </button>
+              {aiScores.size > 0 && (
+                <button className="wl-btn sr-clear" onClick={clearSmartRank}>
+                  Clear AI cache
+                </button>
+              )}
               {aiError && <p className="ai-err">{aiError}</p>}
+              {aiWarnings.map((w, i) => (
+                <p className="ai-warn" key={i}>
+                  {w}
+                </p>
+              ))}
               <p className="hint">
-                Your key stays in the browser (never saved) and calls go directly
-                to Anthropic. In this mode your resume text is sent to the API to
-                judge fit semantically.
+                Your key stays in this browser tab (never saved). Calls go directly
+                from here to Anthropic, and in this mode your resume text is sent to
+                the Anthropic API to judge fit. Rough cost scales with the number of
+                candidates.
               </p>
             </section>
           </aside>
@@ -418,6 +510,9 @@ export default function App() {
                         <span className="job-src">{j.source}</span>
                       </div>
                       <h4 className="job-title">{j.title}</h4>
+                      {j.ai && j.ai.reason && (
+                        <p className="ai-reason">{j.ai.reason}</p>
+                      )}
                       <div className="job-meta">
                         {j.location && <span>{j.location}</span>}
                         {j.remote && <span className="tag-remote">Remote</span>}
@@ -425,22 +520,27 @@ export default function App() {
                       </div>
                     </div>
                     <div className="job-right">
-                      {j.ai && (
-                        <div className="ai-score" title="Claude semantic fit score">
-                          {j.ai.score}
-                        </div>
-                      )}
-                      {keywords.length + titlesArr.length > 0 && (
-                        <div className="match" title="Keyword match score">
-                          {j.match}
-                        </div>
+                      {j.ai ? (
+                        <>
+                          <div className="ai-score" title="Smart-rank fit score">
+                            {j.ai.score}
+                          </div>
+                          {hasScores && (
+                            <div className="match match-mini" title="Keyword match">
+                              {j.match}
+                            </div>
+                          )}
+                        </>
+                      ) : (
+                        hasScores && (
+                          <div className="match" title="Keyword match score">
+                            {j.match}
+                          </div>
+                        )
                       )}
                       {j.comp && <div className="comp">{j.comp}</div>}
                     </div>
                   </div>
-                  {j.ai && j.ai.reason && (
-                    <p className="ai-reason">“{j.ai.reason}”</p>
-                  )}
                   {preview && (
                     <>
                       {isOpen ? (

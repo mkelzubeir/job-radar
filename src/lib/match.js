@@ -25,7 +25,7 @@ export function rankJobs(jobs, keywords = [], targetTitles = []) {
       let df = 0;
       for (const d of docs) if (d.text.includes(term)) df++;
       const idf = Math.log(1 + N / (1 + df));
-      return { term, eff: (k.weight || 0) * idf };
+      return { term, eff: (k.weight || 0) * idf, df };
     });
 
   // Optional target titles, normalized and de-blanked.
@@ -35,7 +35,11 @@ export function rankJobs(jobs, keywords = [], targetTitles = []) {
 
   // "strong" reference: what a genuinely strong resume match looks like, used
   // as a floor for the denominator so a scan of uniformly poor fits stays low.
+  // Only count keywords that at least one scanned job actually contains (df>=1)
+  // — a name or email (df=0) is matchable by no job and would otherwise inflate
+  // this floor and suppress every score.
   const topEff = effective
+    .filter((e) => e.df >= 1)
     .map((e) => e.eff)
     .sort((a, b) => b - a)
     .slice(0, 8)

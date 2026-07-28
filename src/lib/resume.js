@@ -1,7 +1,8 @@
 /**
  * Resume parsing — runs entirely in the browser.
  * PDF text extraction uses pdf.js; .txt/.md are read directly.
- * The resume never leaves the user's machine.
+ * The resume never leaves the user's machine (except in optional Smart-rank
+ * mode, where the full text is sent to the Anthropic API — see src/lib/ai.js).
  */
 import * as pdfjsLib from "pdfjs-dist";
 import workerUrl from "pdfjs-dist/build/pdf.worker.min.mjs?url";
@@ -29,37 +30,96 @@ const STOPWORDS = new Set(
   )
 );
 
-// Generic resume words that match every job description and add noise.
+// Generic resume words that match every job description and add noise. Includes
+// month names + abbreviations and contact/eligibility boilerplate that would
+// otherwise surface as "keywords".
 const NOISE = new Set(
-  `experience work team teams role company companies year years month months responsibilities skills including led built managed developed strong new key drive support ability work working email phone linkedin github university college bachelor master degree gpa january february march april may june july august september october november december`.split(
+  `experience work team teams role company companies year years month months responsibilities skills including led built managed developed strong new key drive support ability work working email phone linkedin github university college bachelor master degree gpa january february march april may june july august september october november december jan feb mar apr jun jul aug sep sept oct nov dec present current resident permanent citizen citizenship visa authorized authorization references cum laude summa magna`.split(
     " "
   )
 );
+
+// A token is "digit-heavy" when more than a third of its characters are digits.
+// Kills years/dates/zips ("2024", "07960") while keeping "b2b" and "gpt-4".
+const digitHeavy = (t) => {
+  const d = (t.match(/\d/g) || []).length;
+  return d * 3 > t.length;
+};
+
+// (a) Strip contact info and dates from the raw text BEFORE tokenizing so their
+// fragments never become candidate keywords.
+const preClean = (text) =>
+  (text || "")
+    .replace(/[\w.+-]+@[\w.-]+\.\w+/g, " ") // emails
+    .replace(/\bhttps?:\/\/\S+/gi, " ") // urls
+    .replace(/\bwww\.\S+/gi, " ") // bare www urls
+    .replace(/\b(?:linkedin|github)\b[\s:/]*[\w./-]*/gi, " ") // handles
+    .replace(/\b[\w.-]+\.(?:com|net|org|io|dev|ai|co|edu|gov)\b/gi, " ") // stray domains (broken emails)
+    .replace(/\+\d[\d\s().-]*/g, " ") // +1 609..., +44 ...
+    .replace(/\(\d{3}\)[\s.-]*\d{3}[\s.-]*\d{4}/g, " ") // (xxx) xxx-xxxx
+    .replace(/\b\d{3}[\s.-]\d{3}[\s.-]\d{4}\b/g, " ") // xxx-xxx-xxxx
+    .replace(/\b\d{7,}\b/g, " "); // digit runs of 7+
 
 const tokenize = (text) =>
   text
     .toLowerCase()
     .replace(/[^a-z0-9+#./\s-]/g, " ")
     .split(/\s+/)
-    .filter((w) => w.length > 1 && !STOPWORDS.has(w));
+    .filter((w) => w.length > 1 && !STOPWORDS.has(w) && !digitHeavy(w));
+
+const isBad = (w) => STOPWORDS.has(w) || NOISE.has(w) || digitHeavy(w);
 
 /**
- * Extract weighted keywords: unigrams and bigrams by frequency,
- * with noise terms removed. Returns [{ term, weight }] sorted by weight.
+ * Extract weighted keywords: unigrams and bigrams by frequency, with contact
+ * info, dates, and boilerplate removed. Returns [{ term, weight }] by weight.
  */
 export function extractKeywords(text, max = 40) {
-  const tokens = tokenize(text);
-  const counts = new Map();
-  const bump = (term, w) => counts.set(term, (counts.get(term) || 0) + w);
+  const cleaned = preClean(text);
+  const tokens = tokenize(cleaned);
 
-  tokens.forEach((t) => {
-    if (!NOISE.has(t)) bump(t, 1);
-  });
+  // Unigram occurrence counts (skip pure noise words).
+  const uni = new Map();
+  for (const t of tokens) if (!NOISE.has(t)) uni.set(t, (uni.get(t) || 0) + 1);
+
+  // (d) Bigram occurrence counts — skip when either word is noise, a stopword,
+  // or digit-heavy (tokenize already dropped stopwords/digit-heavy tokens).
+  const bi = new Map();
   for (let i = 0; i < tokens.length - 1; i++) {
     const a = tokens[i], b = tokens[i + 1];
-    if (NOISE.has(a) || NOISE.has(b)) continue;
-    bump(`${a} ${b}`, 2.5); // phrases are far more discriminative
+    if (isBad(a) || isBad(b)) continue;
+    bi.set(`${a} ${b}`, (bi.get(`${a} ${b}`) || 0) + 1);
   }
+
+  // (e) The person's name repeats in page headers and slips through as a
+  // high-frequency bigram. Drop the top-frequency bigram(s) that also appear in
+  // the first 120 chars of the cleaned text, plus any unigram that occurs ONLY
+  // inside those bigrams.
+  const headerTokens = tokenize(cleaned.slice(0, 120));
+  const headerBigrams = new Set();
+  for (let i = 0; i < headerTokens.length - 1; i++) {
+    headerBigrams.add(`${headerTokens[i]} ${headerTokens[i + 1]}`);
+  }
+  const dropBigrams = new Set();
+  const nameWordCounts = new Map();
+  const headerEntries = [...bi.entries()].filter(([k]) => headerBigrams.has(k));
+  if (headerEntries.length) {
+    const maxc = Math.max(...headerEntries.map(([, c]) => c));
+    for (const [k, c] of headerEntries) {
+      if (c !== maxc) continue;
+      dropBigrams.add(k);
+      const [a, b] = k.split(" ");
+      nameWordCounts.set(a, (nameWordCounts.get(a) || 0) + c);
+      nameWordCounts.set(b, (nameWordCounts.get(b) || 0) + c);
+    }
+  }
+  const dropUnigram = new Set();
+  for (const [w, inName] of nameWordCounts) {
+    if ((uni.get(w) || 0) <= inName) dropUnigram.add(w);
+  }
+
+  const counts = new Map();
+  for (const [t, c] of uni) if (!dropUnigram.has(t)) counts.set(t, c);
+  for (const [k, c] of bi) if (!dropBigrams.has(k)) counts.set(k, c * 2.5); // phrases discriminate more
 
   return [...counts.entries()]
     .filter(([, w]) => w >= 2)
