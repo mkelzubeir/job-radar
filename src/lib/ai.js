@@ -11,8 +11,7 @@
  * compact view of the candidate jobs are sent to Anthropic.
  */
 const API_URL = "https://api.anthropic.com/v1/messages";
-// NOTE: spec named claude-sonnet-4-6, but the standing instruction for this
-// project is to use Sonnet 5. Change here to switch models.
+// The whole app uses Sonnet 5 (Smart rank + profile here, Deep Scan in deepscan.js).
 const MODEL = "claude-sonnet-5";
 const CACHE_KEY = "jobradar.aiScores";
 const PROFILE_KEY = "jobradar.profile";

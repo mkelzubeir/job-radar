@@ -156,6 +156,49 @@ header { border-bottom: 1px solid var(--line); padding: 28px 0 22px; }
   margin-top: 6px; line-height: 1.4;
 }
 
+/* deep scan — sidebar block */
+.deep-block { margin-top: 16px; padding-top: 14px; border-top: 1px dashed var(--line); }
+.deep-title {
+  font-family: Arial, Helvetica, sans-serif; font-size: 11px; font-weight: 700;
+  text-transform: uppercase; letter-spacing: 0.12em; color: var(--ink-soft);
+  display: flex; align-items: center; gap: 8px;
+}
+.deep-badge {
+  font-size: 9.5px; font-weight: 700; letter-spacing: 0.08em; color: #fff;
+  background: var(--signal); border-radius: 3px; padding: 1px 5px;
+}
+.deep-btn { background: var(--ink); border-color: var(--ink); }
+
+/* deep scan — results tiers */
+.deep-results { margin-bottom: 22px; }
+.deep-tier { margin-bottom: 18px; }
+.deep-tier-h {
+  font-family: Arial, Helvetica, sans-serif; font-size: 13px; font-weight: 700;
+  text-transform: uppercase; letter-spacing: 0.06em; margin-bottom: 8px;
+  display: flex; align-items: center; gap: 8px;
+}
+.deep-tier-n { font-size: 11px; color: var(--ink-soft); font-weight: 500; }
+.deep-tier-apply_now { color: var(--signal); }
+.deep-tier-strong { color: var(--query); }
+.deep-tier-worth_a_look { color: var(--ink-soft); }
+.ds-card { border-left: 3px solid var(--line); }
+.ds-rank {
+  font-family: Arial, Helvetica, sans-serif; font-weight: 700; color: var(--ink);
+  margin-right: 2px;
+}
+.ds-angle { font-size: 13px; color: var(--ink); font-style: italic; margin: 2px 0 4px; }
+.ds-comp {
+  font-size: 11px; border-radius: 3px; padding: 1px 6px; text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+.ds-comp-above { color: var(--query); background: #e6eefb; }
+.ds-comp-within { color: var(--query); background: #e6eefb; }
+.ds-comp-below { color: var(--signal); background: var(--pin); }
+.ds-comp-unknown { color: var(--ink-soft); background: var(--paper); }
+.ds-fit { margin: 8px 0 0 18px; font-size: 13px; color: var(--ink); }
+.ds-fit li { margin-bottom: 2px; }
+.ds-gaps { margin-top: 6px; font-size: 12.5px; color: var(--ink-soft); }
+
 /* filters */
 .filters { display: flex; align-items: center; gap: 16px; flex-wrap: wrap; margin-bottom: 14px; }
 .search {

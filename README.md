@@ -12,16 +12,32 @@ Most great roles never hit LinkedIn feeds or job aggregators in time. They live 
    - **Tier 1 — retrieval (TF-IDF, always on, local & free).** A keyword overlap runs over the *entire* scan. Every keyword is weighted by how rare it is across the scanned jobs (`idf = ln(1 + N/(1+df))`), so ubiquitous terms like "data" or "team" contribute almost nothing while rare, specific terms dominate. Title matches count 4× description matches; optional target titles add exact/partial-credit boosts. Scores normalize so **100 = the best fit in today's scan**. This tier selects the top-N candidates (default 60, adjustable 20–150).
    - **Tier 2 — local embeddings ("Semantic boost", optional, no key).** Toggle it on and Job Radar lazy-loads a small MiniLM sentence-embedding model (`Xenova/all-MiniLM-L6-v2`, ~25 MB, downloaded once and cached by the browser) via transformers.js. It embeds your résumé and the top ~400 candidates and blends `0.5 · cosine + 0.5 · normalized TF-IDF` into the keyword-stage score — semantic matching with **zero API cost**. If the model fails to load it falls back silently to TF-IDF.
    - **Tier 3 — LLM rerank ("Smart rank", optional, API key).** Paste your own Anthropic API key and Claude scores the top-N candidates against your **full résumé text plus the structured profile** — judging seniority match, domain overlap, transferable skills, and trajectory (a sensible next role, not just keyword overlap) — returning a 0–100 fit score and a one-line reason per job. When present, the AI score becomes the primary ranking and the keyword score is demoted to a secondary badge.
+   - **Deep Scan — the maximum-quality cascade (optional, API key, expensive by design).** For when you want the best possible shortlist and are willing to spend credits. A four-stage cascade — see below.
 4. **Filtering.** Remote-only, has-compensation, minimum score (applied to whichever score is primary), and free-text filters.
+
+### Deep Scan — retrieve → screen → deep read → tournament
+
+Deep Scan is the deliberately expensive path: it spends real API credits to get a hand-recruiter-quality shortlist. Every call uses `claude-sonnet-5`, direct from the browser. The cascade is designed so cost is spent where it matters — breadth first with cheap passes, depth only on the survivors:
+
+| Stage | What it does | Scope | Cost |
+|---|---|---|---|
+| **0 · Pool** | Union of the top 1500 by TF-IDF, top 1500 by local embeddings (if Semantic boost ran), and every job whose title matches a target title. Deduped. | ~up to 2000 jobs | Local, free |
+| **1 · Screen** | Claude scores the whole pool (compact job data) to kill obvious non-fits. Batches of ~40, 4 concurrent, 429-backoff. | pool → **top 150** | Cheap-ish |
+| **2 · Deep read** | Full job descriptions (~4000 chars) + your **full résumé**. Returns score, `fit_reasons`, `gaps`, `comp_check`, and an `apply_angle` per job, with instructions to be skeptical (scores > 85 are rare). Batches of ~8, 3 concurrent. | 150 → survivors | The bulk of the spend |
+| **3 · Tournament** | One comparative call ranks the **top 30** against each other for *you specifically* (absolute scores drift between batches; comparison fixes it), assigning a rank + tier. | top 30 | One call |
+
+Results are presented in three tiers — **Apply now**, **Strong**, **Worth a look** — each card showing rank, fit score, `fit_reasons` (bullets), `gaps` (muted), the `apply_angle` (italic), and a `comp_check` badge. Everything outside the shortlist stays keyword-ranked below. **"Download shortlist (CSV)"** exports the tiered results (company, title, location, comp, tier, rank, score, apply_angle, url).
+
+**Cost.** You see a rough estimate (from pool size and token accounting) and confirm **before** anything runs. As a ballpark, a full scan pool of ~1500–2000 jobs runs on the order of a few US dollars, dominated by Stage 2's full-description reads. Every stage output is **cached in `localStorage` by résumé-hash + job id**, so an interrupted or re-run Deep Scan only pays for what's new. Per-batch failures are non-fatal — the cascade keeps going and notes what was skipped.
 
 ### AI features — privacy & cost
 
-Tier 1 and Tier 2 are **fully local** (Tier 2 downloads a model but runs inference in your browser — no data leaves the device). The Claude-powered features (AI profile extraction and Smart rank) are the **only** ones that send data off your device:
+Tier 1 and Tier 2 are **fully local** (Tier 2 downloads a model but runs inference in your browser — no data leaves the device). The Claude-powered features (AI profile extraction, Smart rank, and Deep Scan) are the **only** ones that send data off your device:
 
 - Requests go **directly from your browser to the Anthropic API** — there is still no backend.
 - Your API key is held in **memory only** (React state), never written to `localStorage`.
-- In these modes your **full résumé text** — and, for Smart rank, a compact view of the candidate jobs (title, company, location, comp, first ~800 chars of description) — are sent to Anthropic.
-- Rough **cost scales with the candidate count** (jobs scored ~20 per request; profile extraction is one call). Results are cached locally, keyed to your résumé, so re-scans and reloads don't re-bill; "Clear AI cache" resets both the scores and the profile.
+- In these modes your **full résumé text** — and a view of the candidate jobs (Smart rank: first ~800 chars of description; Deep Scan Stage 2: up to ~4000 chars) — are sent to Anthropic.
+- Results are cached locally, keyed to your résumé, so re-runs and reloads don't re-bill; **"Clear AI cache"** resets the profile, Smart-rank scores, and all Deep Scan stage caches.
 
 ## Supported ATS platforms
 
@@ -56,6 +72,7 @@ src/
     match.js    Tier 1 — TF-IDF retrieval and scoring
     embed.js    Tier 2 — local MiniLM embeddings (lazy, code-split)
     ai.js       Tier 3 — Claude profile extraction + Smart-rank scoring
+    deepscan.js Deep Scan — 4-stage retrieve→screen→deep-read→tournament cascade
   data/
     companies.json   verified seed watchlist (editable in-app, persisted to localStorage)
   App.jsx       UI: upload, watchlist manager, streaming scan, three-tier ranked results

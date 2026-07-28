@@ -3,6 +3,13 @@ import { ADAPTERS, scanCompanies } from "./lib/ats";
 import { extractResumeText, extractKeywords } from "./lib/resume";
 import { rankJobs } from "./lib/match";
 import { semanticRank, clearAiCache, extractProfile } from "./lib/ai";
+import {
+  deepScan,
+  buildPool,
+  estimateCost,
+  clearDeepScanCache,
+  deepScanCSV,
+} from "./lib/deepscan";
 import seedCompanies from "./data/companies.json";
 
 const LS = {
@@ -116,6 +123,12 @@ export default function App() {
   const [aiProgress, setAiProgress] = useState([0, 0]);
   const [aiError, setAiError] = useState(null);
   const [aiWarnings, setAiWarnings] = useState([]);
+
+  // Deep Scan — the maximum-quality, expensive cascade.
+  const [deepBusy, setDeepBusy] = useState(false);
+  const [deepProg, setDeepProg] = useState(null); // { stage, label, done, total }
+  const [deepResults, setDeepResults] = useState(null); // { ranked, warnings, stats }
+  const [deepError, setDeepError] = useState(null);
 
   // Semantic boost (Stage 2) — optional local embeddings, no API key.
   const [semBoost, setSemBoost] = useState(false);
@@ -297,7 +310,15 @@ export default function App() {
   // The primary score is the AI score when present, else the keyword score.
   const primaryScore = (j) => (j.ai ? j.ai.score : j.match);
 
+  // IDs shown in the Deep Scan tiers — excluded from the keyword list below so
+  // a job isn't rendered twice.
+  const deepIds = useMemo(
+    () => new Set((deepResults?.ranked || []).map((r) => r.id)),
+    [deepResults]
+  );
+
   const visible = withAi.filter((j) => {
+    if (deepIds.has(String(j.id))) return false; // already in the Deep Scan tiers
     if (remoteOnly && !j.remote) return false;
     if (compOnly && !j.comp) return false;
     if (primaryScore(j) < minMatch) return false; // filter on whichever score is primary
@@ -394,13 +415,84 @@ export default function App() {
 
   function clearSmartRank() {
     clearAiCache();
+    clearDeepScanCache();
     setAiScores(new Map());
     setAiWarnings([]);
     setAiError(null);
     setProfile(null);
+    setDeepResults(null);
+    setDeepError(null);
+  }
+
+  // The profile Deep Scan reasons over — the AI profile if extracted, else a
+  // minimal one seeded from the user's target-titles field.
+  const dsProfile =
+    profile || (titlesArr.length ? { titles: titlesArr } : null);
+
+  // Attach embedding scores (if a Semantic boost ran) so Stage 0 can union them.
+  const jobsForDeep = semScores.size
+    ? ranked.map((j) => ({ ...j, sem: semScores.get(j.id) }))
+    : ranked;
+
+  async function runDeepScan() {
+    const key = aiKey.trim();
+    if (!key) {
+      setDeepError("Enter your Anthropic API key below first.");
+      return;
+    }
+    if (!resumeText.trim() || !ranked.length || deepBusy) return;
+
+    const pool = buildPool(jobsForDeep, dsProfile);
+    const est = estimateCost(pool.length);
+    const ok = window.confirm(
+      `Deep Scan runs a 3-stage Claude cascade (screen → deep read → tournament) over ~${pool.length} candidate jobs.\n\n` +
+        `This is the maximum-quality, most EXPENSIVE option.\n\n` +
+        `Rough estimate: ~$${est.usd.toFixed(2)} ` +
+        `(~${Math.round(est.inTok / 1000)}k input / ${Math.round(est.outTok / 1000)}k output tokens, ` +
+        `cached so re-runs only pay for what's new).\n\nProceed?`
+    );
+    if (!ok) return;
+
+    setDeepBusy(true);
+    setDeepError(null);
+    setDeepResults(null);
+    setDeepProg(null);
+    try {
+      const res = await deepScan(resumeText, dsProfile, jobsForDeep, key, (p) =>
+        setDeepProg(p)
+      );
+      setDeepResults(res);
+    } catch (e) {
+      console.error("Deep Scan failed:", e);
+      setDeepError(humanizeAiError(e));
+    } finally {
+      setDeepBusy(false);
+    }
+  }
+
+  function downloadShortlist() {
+    if (!deepResults?.ranked?.length) return;
+    const blob = new Blob([deepScanCSV(deepResults.ranked)], {
+      type: "text/csv;charset=utf-8",
+    });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = "job-radar-shortlist.csv";
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
   }
 
   const hasScores = keywords.length + titlesArr.length > 0;
+
+  const DEEP_TIERS = [
+    { key: "apply_now", label: "Apply now" },
+    { key: "strong", label: "Strong" },
+    { key: "worth_a_look", label: "Worth a look" },
+  ];
+  const COMP_LABEL = { above: "comp: above", within: "comp: within", below: "comp: below", unknown: "comp: n/a" };
 
   return (
     <>
@@ -638,6 +730,39 @@ export default function App() {
                 the Anthropic API to extract your profile and judge fit. Rough cost
                 scales with the number of candidates.
               </p>
+
+              <div className="deep-block">
+                <div className="deep-title">
+                  Deep Scan <span className="deep-badge">max quality</span>
+                </div>
+                <button
+                  className="ai-btn deep-btn"
+                  onClick={runDeepScan}
+                  disabled={deepBusy || !aiKey.trim() || !resumeText || !ranked.length}
+                  title={aiKey.trim() ? "" : "Enter your Anthropic API key above first"}
+                >
+                  {deepBusy ? (
+                    <>
+                      <span className="spinner" aria-hidden="true" />{" "}
+                      {deepProg ? `${deepProg.label} ${deepProg.done}/${deepProg.total}…` : "Starting…"}
+                    </>
+                  ) : (
+                    "Run Deep Scan"
+                  )}
+                </button>
+                {deepResults?.ranked?.length > 0 && (
+                  <button className="wl-btn sr-clear" onClick={downloadShortlist}>
+                    ↓ Download shortlist (CSV)
+                  </button>
+                )}
+                {deepError && <p className="ai-err">{deepError}</p>}
+                <p className="hint">
+                  A 3-stage cascade — screen → deep read → tournament — over a wide
+                  candidate pool. The maximum-quality, most expensive path; you'll
+                  see a cost estimate and confirm before it runs. Results cache
+                  locally, so re-runs only pay for what's new.
+                </p>
+              </div>
             </section>
           </aside>
 
@@ -708,10 +833,83 @@ export default function App() {
               </div>
             )}
 
+            {deepResults?.ranked?.length > 0 && (
+              <section className="deep-results">
+                <div className="results-head">
+                  <h2>Deep Scan shortlist</h2>
+                  <span className="stamp">
+                    {deepResults.stats.pool} screened · {deepResults.stats.deep} deep-read ·{" "}
+                    {deepResults.ranked.length} ranked
+                  </span>
+                </div>
+                {deepResults.warnings.map((w, i) => (
+                  <p className="ai-warn" key={i}>
+                    {w}
+                  </p>
+                ))}
+                {DEEP_TIERS.map(({ key, label }) => {
+                  const rows = deepResults.ranked.filter((r) => r.tier === key);
+                  if (!rows.length) return null;
+                  return (
+                    <div className="deep-tier" key={key}>
+                      <h3 className={`deep-tier-h deep-tier-${key}`}>
+                        {label} <span className="deep-tier-n">{rows.length}</span>
+                      </h3>
+                      {rows.map((r) => (
+                        <article className="job ds-card" key={r.id}>
+                          <div className="job-head">
+                            <div>
+                              <div className="job-co">
+                                <span className="ds-rank">#{r.rank}</span>
+                                {r.company}
+                                <span className="job-src">{r.source}</span>
+                              </div>
+                              <h4 className="job-title">{r.title}</h4>
+                              {r.apply_angle && (
+                                <p className="ds-angle">{r.apply_angle}</p>
+                              )}
+                              <div className="job-meta">
+                                {r.location && <span>{r.location}</span>}
+                                {r.remote && <span className="tag-remote">Remote</span>}
+                                <span className={`ds-comp ds-comp-${r.comp_check}`}>
+                                  {COMP_LABEL[r.comp_check]}
+                                </span>
+                              </div>
+                            </div>
+                            <div className="job-right">
+                              <div className="ai-score" title="Deep Scan fit score">
+                                {r.score}
+                              </div>
+                              {r.comp && <div className="comp">{r.comp}</div>}
+                            </div>
+                          </div>
+                          {r.fit_reasons.length > 0 && (
+                            <ul className="ds-fit">
+                              {r.fit_reasons.map((f, i) => (
+                                <li key={i}>{f}</li>
+                              ))}
+                            </ul>
+                          )}
+                          {r.gaps.length > 0 && (
+                            <p className="ds-gaps">Gaps: {r.gaps.join(" · ")}</p>
+                          )}
+                          <a className="apply" href={r.url} target="_blank" rel="noreferrer">
+                            View posting ↗
+                          </a>
+                        </article>
+                      ))}
+                    </div>
+                  );
+                })}
+              </section>
+            )}
+
             <div className="results-head">
               <h2>
                 {jobs.length
-                  ? `${visible.length} of ${jobs.length} roles`
+                  ? deepResults?.ranked?.length
+                    ? `${visible.length} more, keyword-ranked`
+                    : `${visible.length} of ${jobs.length} roles`
                   : "No scan yet"}
               </h2>
               {scannedAt && <span className="stamp">last scan {scannedAt.toLocaleTimeString()}</span>}
