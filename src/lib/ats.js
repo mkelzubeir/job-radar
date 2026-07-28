@@ -8,11 +8,38 @@
  * for embedding job boards, so no API keys or backend are required.
  */
 
+// Greenhouse (and occasionally others) return job content as HTML-ESCAPED html
+// (e.g. "&lt;div&gt;"), sometimes double-escaped. Decode entities first, then
+// convert block-level structure to newlines/bullets, then strip remaining tags
+// while preserving paragraph and list structure.
 const stripHtml = (html) => {
   if (!html) return "";
+
+  // (a) Repeatedly decode HTML entities via a textarea until no encoded
+  // angle-bracket/ampersand entities remain (handles double-escaping). Max 3.
+  const decoder = document.createElement("textarea");
+  let text = String(html);
+  for (let i = 0; i < 3 && /&(lt|gt|amp);/i.test(text); i++) {
+    decoder.innerHTML = text;
+    text = decoder.value;
+  }
+
+  // (b) Preserve paragraph/list structure before stripping tags: block-level
+  // closing tags and <br> become newlines; list-item openers become bullets.
+  text = text
+    .replace(/<\s*br\s*\/?\s*>/gi, "\n")
+    .replace(/<\/\s*(?:p|div|li|ul|ol|h[1-6]|tr)\s*>/gi, "\n")
+    .replace(/<\s*li(?:\s[^>]*)?>/gi, "• ");
+
+  // (c) Strip remaining tags via innerHTML -> textContent, collapse spaces/tabs
+  // but PRESERVE newlines, and cap runs of newlines at 2.
   const div = document.createElement("div");
-  div.innerHTML = html;
-  return (div.textContent || "").replace(/\s+/g, " ").trim();
+  div.innerHTML = text;
+  return (div.textContent || "")
+    .replace(/[ \t]+/g, " ")
+    .replace(/ *\n */g, "\n")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
 };
 
 // Pull a salary range out of free text when the ATS doesn't expose one.

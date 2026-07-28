@@ -2,12 +2,14 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { ADAPTERS, scanCompanies } from "./lib/ats";
 import { extractResumeText, extractKeywords } from "./lib/resume";
 import { rankJobs } from "./lib/match";
+import { aiRerank } from "./lib/ai";
 import seedCompanies from "./data/companies.json";
 
 const LS = {
   companies: "jobradar.companies",
   keywords: "jobradar.keywords",
   titles: "jobradar.titles",
+  resume: "jobradar.resume",
 };
 const load = (k, fallback) => {
   try {
@@ -32,12 +34,19 @@ export default function App() {
   const [companies, setCompanies] = useState(() => load(LS.companies, seedCompanies));
   const [keywords, setKeywords] = useState(() => load(LS.keywords, []));
   const [targetTitles, setTargetTitles] = useState(() => load(LS.titles, ""));
+  const [resumeText, setResumeText] = useState(() => load(LS.resume, ""));
   const [resumeName, setResumeName] = useState("");
   const [jobs, setJobs] = useState([]);
   const [errors, setErrors] = useState([]);
   const [scanning, setScanning] = useState(false);
   const [progress, setProgress] = useState([0, 0]);
   const [scannedAt, setScannedAt] = useState(null);
+
+  // AI re-rank (key kept only in state, never persisted)
+  const [aiKey, setAiKey] = useState("");
+  const [aiScores, setAiScores] = useState(() => new Map());
+  const [aiBusy, setAiBusy] = useState(false);
+  const [aiError, setAiError] = useState(null);
 
   // Filters
   const [q, setQ] = useState("");
@@ -49,16 +58,19 @@ export default function App() {
   // Add-company form
   const [newCo, setNewCo] = useState({ name: "", ats: "ashby", slug: "" });
   const fileRef = useRef(null);
+  const importRef = useRef(null);
 
   useEffect(() => localStorage.setItem(LS.companies, JSON.stringify(companies)), [companies]);
   useEffect(() => localStorage.setItem(LS.keywords, JSON.stringify(keywords)), [keywords]);
   useEffect(() => localStorage.setItem(LS.titles, JSON.stringify(targetTitles)), [targetTitles]);
+  useEffect(() => localStorage.setItem(LS.resume, JSON.stringify(resumeText)), [resumeText]);
 
   async function onResume(file) {
     if (!file) return;
     setResumeName(file.name);
     try {
       const text = await extractResumeText(file);
+      setResumeText(text);
       setKeywords(extractKeywords(text));
     } catch (e) {
       setErrors((prev) => [...prev, { company: "Resume", ats: "-", message: e.message }]);
@@ -84,7 +96,13 @@ export default function App() {
     [jobs, keywords, targetTitles] // eslint-disable-line react-hooks/exhaustive-deps
   );
 
-  const visible = ranked.filter((j) => {
+  const hasAi = aiScores.size > 0;
+  const withAi = useMemo(
+    () => ranked.map((j) => ({ ...j, ai: aiScores.get(j.id) || null })),
+    [ranked, aiScores]
+  );
+
+  const visible = withAi.filter((j) => {
     if (remoteOnly && !j.remote) return false;
     if (compOnly && !j.comp) return false;
     if (j.match < minMatch) return false;
@@ -95,6 +113,15 @@ export default function App() {
     return true;
   });
 
+  // When AI scores are present, sort by AI score (jobs the AI ranked first).
+  const shown = hasAi
+    ? [...visible].sort((a, b) => {
+        const sa = a.ai ? a.ai.score : -1;
+        const sb = b.ai ? b.ai.score : -1;
+        return sb - sa || b.match - a.match;
+      })
+    : visible;
+
   const removeKeyword = (term) => setKeywords(keywords.filter((k) => k.term !== term));
   const addCompany = () => {
     if (!newCo.slug.trim()) return;
@@ -104,6 +131,56 @@ export default function App() {
     ]);
     setNewCo({ name: "", ats: newCo.ats, slug: "" });
   };
+
+  function exportWatchlist() {
+    const blob = new Blob([JSON.stringify(companies, null, 2)], {
+      type: "application/json",
+    });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = "job-radar-watchlist.json";
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+  }
+
+  async function importWatchlist(file) {
+    if (!file) return;
+    try {
+      const data = JSON.parse(await file.text());
+      if (!Array.isArray(data) || !data.every((c) => c && c.ats && c.slug)) {
+        throw new Error("Expected a JSON array of { name, ats, slug } items.");
+      }
+      setCompanies(
+        data.map((c) => ({ name: c.name || c.slug, ats: c.ats, slug: c.slug }))
+      );
+    } catch (e) {
+      setErrors((prev) => [
+        ...prev,
+        { company: "Import", ats: "-", message: e.message },
+      ]);
+    }
+  }
+
+  async function runAiRerank() {
+    if (!aiKey.trim() || !resumeText.trim() || !ranked.length || aiBusy) return;
+    setAiBusy(true);
+    setAiError(null);
+    try {
+      const scores = await aiRerank({
+        apiKey: aiKey.trim(),
+        resumeText,
+        jobs: ranked,
+      });
+      setAiScores(scores);
+    } catch (e) {
+      setAiError(e.message);
+    } finally {
+      setAiBusy(false);
+    }
+  }
 
   return (
     <>
@@ -162,7 +239,7 @@ export default function App() {
 
             {/* Target titles */}
             <section className="card">
-              <h3>2 · Target titles</h3>
+              <h3>2 · Target titles (optional)</h3>
               <input
                 value={targetTitles}
                 onChange={(e) => setTargetTitles(e.target.value)}
@@ -220,6 +297,49 @@ export default function App() {
                   Slug = the company's board URL ending, e.g. jobs.ashbyhq.com/<b>openai</b>.
                 </p>
               </div>
+              <div className="wl-actions">
+                <button className="wl-btn" onClick={exportWatchlist}>
+                  ↓ Export
+                </button>
+                <input
+                  ref={importRef}
+                  type="file"
+                  accept=".json,application/json"
+                  hidden
+                  onChange={(e) => {
+                    importWatchlist(e.target.files[0]);
+                    e.target.value = "";
+                  }}
+                />
+                <button className="wl-btn" onClick={() => importRef.current.click()}>
+                  ↑ Import
+                </button>
+              </div>
+            </section>
+
+            {/* AI re-rank */}
+            <section className="card">
+              <h3>4 · AI re-rank (optional)</h3>
+              <input
+                type="password"
+                value={aiKey}
+                onChange={(e) => setAiKey(e.target.value)}
+                placeholder="sk-ant-… Anthropic API key"
+                autoComplete="off"
+              />
+              <button
+                className="ai-btn"
+                onClick={runAiRerank}
+                disabled={aiBusy || !aiKey.trim() || !resumeText || !ranked.length}
+              >
+                {aiBusy ? "Re-ranking…" : "Re-rank top 30 with Claude"}
+              </button>
+              {aiError && <p className="ai-err">{aiError}</p>}
+              <p className="hint">
+                Your key stays in the browser (never saved) and calls go directly
+                to Anthropic. In this mode your resume text is sent to the API to
+                judge fit semantically.
+              </p>
             </section>
           </aside>
 
@@ -286,51 +406,69 @@ export default function App() {
               </div>
             )}
 
-            {visible.map((j) => (
-              <article className="job" key={j.id}>
-                <div className="job-head">
-                  <div>
-                    <div className="job-co">
-                      {j.company}
-                      <span className="job-src">{j.source}</span>
-                    </div>
-                    <h4 className="job-title">{j.title}</h4>
-                    <div className="job-meta">
-                      {j.location && <span>{j.location}</span>}
-                      {j.remote && <span className="tag-remote">Remote</span>}
-                      {j.postedAt && <span>{timeAgo(j.postedAt)}</span>}
-                    </div>
-                  </div>
-                  <div className="job-right">
-                    {keywords.length + titlesArr.length > 0 && (
-                      <div className="match" title="Resume match score">
-                        {j.match}
+            {shown.map((j) => {
+              const preview = (j.description || "").replace(/\s+/g, " ").trim();
+              const isOpen = expanded === j.id;
+              return (
+                <article className="job" key={j.id}>
+                  <div className="job-head">
+                    <div>
+                      <div className="job-co">
+                        {j.company}
+                        <span className="job-src">{j.source}</span>
                       </div>
-                    )}
-                    {j.comp && <div className="comp">{j.comp}</div>}
+                      <h4 className="job-title">{j.title}</h4>
+                      <div className="job-meta">
+                        {j.location && <span>{j.location}</span>}
+                        {j.remote && <span className="tag-remote">Remote</span>}
+                        {j.postedAt && <span>{timeAgo(j.postedAt)}</span>}
+                      </div>
+                    </div>
+                    <div className="job-right">
+                      {j.ai && (
+                        <div className="ai-score" title="Claude semantic fit score">
+                          {j.ai.score}
+                        </div>
+                      )}
+                      {keywords.length + titlesArr.length > 0 && (
+                        <div className="match" title="Keyword match score">
+                          {j.match}
+                        </div>
+                      )}
+                      {j.comp && <div className="comp">{j.comp}</div>}
+                    </div>
                   </div>
-                </div>
-                {j.description && (
-                  <p className="job-desc">
-                    {expanded === j.id
-                      ? j.description.slice(0, 1500)
-                      : j.description.slice(0, 220) +
-                        (j.description.length > 220 ? "…" : "")}
-                    {j.description.length > 220 && (
-                      <button
-                        className="more"
-                        onClick={() => setExpanded(expanded === j.id ? null : j.id)}
-                      >
-                        {expanded === j.id ? "less" : "more"}
-                      </button>
-                    )}
-                  </p>
-                )}
-                <a className="apply" href={j.url} target="_blank" rel="noreferrer">
-                  View posting ↗
-                </a>
-              </article>
-            ))}
+                  {j.ai && j.ai.reason && (
+                    <p className="ai-reason">“{j.ai.reason}”</p>
+                  )}
+                  {preview && (
+                    <>
+                      {isOpen ? (
+                        <p className="job-desc job-desc-full">
+                          {(j.description || "").slice(0, 3000)}
+                        </p>
+                      ) : (
+                        <p className="job-desc">
+                          {preview.slice(0, 220)}
+                          {preview.length > 220 ? "…" : ""}
+                        </p>
+                      )}
+                      {preview.length > 220 && (
+                        <button
+                          className="more"
+                          onClick={() => setExpanded(isOpen ? null : j.id)}
+                        >
+                          {isOpen ? "show less" : "show more"}
+                        </button>
+                      )}
+                    </>
+                  )}
+                  <a className="apply" href={j.url} target="_blank" rel="noreferrer">
+                    View posting ↗
+                  </a>
+                </article>
+              );
+            })}
           </main>
         </div>
       </div>

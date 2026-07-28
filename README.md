@@ -8,8 +8,14 @@ Most great roles never hit LinkedIn feeds or job aggregators in time. They live 
 
 1. **Resume parsing.** Drop in a PDF (parsed with pdf.js) or plain text. The app extracts weighted keywords and phrases locally. Your resume never leaves your device — there is no backend.
 2. **Board scanning.** For every company on your watchlist, Job Radar hits the public job board API for that company's ATS and normalizes postings into one shape: company, title, location, compensation, description, posting date, apply link.
-3. **Ranking.** Each job gets a 0–100 match score. Title matches are weighted 4x over description matches; multi-word phrases from your resume count more than single keywords. You can also pin target titles that get boosted further.
+3. **Ranking.** Each job gets a 0–100 match score in two stages:
+   - **Keyword stage (always on).** A TF-IDF weighted overlap. Every resume keyword is weighted by how rare it is across the jobs in the current scan (`idf = ln(1 + N/(1+df))`), so ubiquitous terms like "data" or "team" contribute almost nothing while rare, specific terms dominate. Title matches count 4× description matches. Optional target titles add exact/partial-credit boosts. Scores are normalized so that **100 = the best fit in today's scan** — a scan of uniformly weak matches stays low instead of inflating to 100.
+   - **Semantic stage (optional).** Paste your own Anthropic API key to re-rank the current top ~30 jobs with Claude, which judges genuine fit (seniority match, domain overlap, transferable skills) and returns a score plus a one-line reason per job. See the privacy note below.
 4. **Filtering.** Remote-only, has-compensation, minimum match score, and free-text filters.
+
+### Privacy note for AI re-rank
+
+The optional AI re-rank is the **only** feature that sends data off your device. When you use it, the request goes **directly from your browser to the Anthropic API** — there is still no backend. Your API key is held in memory only (never written to `localStorage`), and in this mode your **resume text** and a compact list of the top jobs are sent to Anthropic so the model can judge fit. The keyword stage, and everything else in the app, remains fully local.
 
 ## Supported ATS platforms
 
@@ -68,7 +74,6 @@ If a scan shows an error for a company, the slug is usually wrong or the company
 ## Roadmap
 
 - Workday support via a small serverless proxy
-- Optional LLM-based ranking (resume vs. full job description) with a user-supplied API key
 - New-since-last-scan diffing and notifications
 - Export shortlist to CSV
 
