@@ -62,6 +62,53 @@ const humanizeAiError = (e) => {
   return "Request blocked — check the browser console (network/CORS)";
 };
 
+// --- US location classifier -------------------------------------------------
+// Job locations are free text (e.g. "San Francisco, CA", "Remote - US",
+// "London, UK", "Toronto, ON, Canada"). This is a pragmatic heuristic, tuned
+// for precision (better to drop an ambiguous role than show a non-US one).
+const US_STATE_ABBR = new Set(
+  "AL AK AZ AR CA CO CT DE FL GA HI ID IL IN IA KS KY LA ME MD MA MI MN MS MO MT NE NV NH NJ NM NY NC ND OH OK OR PA RI SC SD TN TX UT VT VA WA WV WI WY DC".split(
+    " "
+  )
+);
+const US_STATE_NAMES = [
+  "alabama","alaska","arizona","arkansas","california","colorado","connecticut","delaware",
+  "florida","georgia","hawaii","idaho","illinois","indiana","iowa","kansas","kentucky",
+  "louisiana","maine","maryland","massachusetts","michigan","minnesota","mississippi","missouri",
+  "montana","nebraska","nevada","new hampshire","new jersey","new mexico","new york",
+  "north carolina","north dakota","ohio","oklahoma","oregon","pennsylvania","rhode island",
+  "south carolina","south dakota","tennessee","texas","utah","vermont","virginia","washington",
+  "west virginia","wisconsin","wyoming","district of columbia",
+];
+const NON_US_RE =
+  /\b(canada|canadian|united kingdom|uk|u\.k\.|britain|england|scotland|wales|ireland|germany|france|spain|italy|netherlands|portugal|poland|romania|sweden|norway|denmark|finland|switzerland|austria|belgium|czech|slovakia|greece|hungary|bulgaria|croatia|serbia|india|china|japan|korea|singapore|hong kong|taiwan|australia|new zealand|brazil|mexico|argentina|chile|colombia|peru|uruguay|israel|turkey|egypt|morocco|nigeria|kenya|ghana|south africa|uae|united arab emirates|dubai|abu dhabi|saudi|qatar|bahrain|kuwait|philippines|indonesia|thailand|vietnam|malaysia|pakistan|bangladesh|sri lanka|ukraine|russia|estonia|latvia|lithuania|slovenia|luxembourg|iceland|emea|apac|latam|europe)\b/;
+
+function isUSJob(job) {
+  const loc = (job.location || "").trim();
+  if (!loc) return false; // no location (incl. bare "Remote") — can't confirm US
+  const lc = loc.toLowerCase();
+
+  // Explicit US markers first (win over everything).
+  if (/\bunited states\b/.test(lc) || /\busa\b/.test(lc) || /u\.s\.?a?\.?/.test(lc)) return true;
+
+  // SmartRecruiters encodes the country as an uppercased ISO code at the end
+  // ("New York, US" vs "Toronto, CA" = Canada), so trust only an explicit US.
+  if (job.source === "SmartRecruiters") return /,\s*US\b/.test(loc);
+
+  // Any explicit non-US country/region → not US.
+  if (NON_US_RE.test(lc)) return false;
+
+  // Standalone "US" token (", US", "US Remote", "(US)").
+  if (/\bus\b/.test(lc)) return true;
+  // Full US state name.
+  if (US_STATE_NAMES.some((s) => lc.includes(s))) return true;
+  // "City, ST" two-letter US state abbreviation.
+  const m = loc.match(/,\s*([A-Z]{2})\b/);
+  if (m && US_STATE_ABBR.has(m[1])) return true;
+
+  return false;
+}
+
 // Merge the current seed into the user's stored list when the seed version has
 // advanced: dedupe by ats:slug (case-insensitive), keep user-added entries, and
 // append any missing seed entries. NOTE: a user who deleted a seed company will
@@ -140,6 +187,7 @@ export default function App() {
 
   // Filters
   const [q, setQ] = useState("");
+  const [usOnly, setUsOnly] = useState(true); // default: US-only
   const [remoteOnly, setRemoteOnly] = useState(false);
   const [compOnly, setCompOnly] = useState(false);
   const [minMatch, setMinMatch] = useState(0);
@@ -319,6 +367,7 @@ export default function App() {
 
   const visible = withAi.filter((j) => {
     if (deepIds.has(String(j.id))) return false; // already in the Deep Scan tiers
+    if (usOnly && !isUSJob(j)) return false;
     if (remoteOnly && !j.remote) return false;
     if (compOnly && !j.comp) return false;
     if (primaryScore(j) < minMatch) return false; // filter on whichever score is primary
@@ -774,6 +823,14 @@ export default function App() {
                 value={q}
                 onChange={(e) => setQ(e.target.value)}
               />
+              <label className="check" title="Show only jobs located in the United States">
+                <input
+                  type="checkbox"
+                  checked={usOnly}
+                  onChange={(e) => setUsOnly(e.target.checked)}
+                />
+                US only
+              </label>
               <label className="check">
                 <input
                   type="checkbox"
@@ -848,7 +905,9 @@ export default function App() {
                   </p>
                 ))}
                 {DEEP_TIERS.map(({ key, label }) => {
-                  const rows = deepResults.ranked.filter((r) => r.tier === key);
+                  const rows = deepResults.ranked.filter(
+                    (r) => r.tier === key && (!usOnly || isUSJob(r))
+                  );
                   if (!rows.length) return null;
                   return (
                     <div className="deep-tier" key={key}>
