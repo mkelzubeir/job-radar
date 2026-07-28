@@ -1,146 +1,335 @@
 # Job Radar
 
-**Upload a resume. Scan the hidden job boards of any company you care about. Get every open role ranked against you.**
+**Scan company career pages directly and rank open roles against your resume.**
 
-Most great roles never hit LinkedIn feeds or job aggregators in time. They live on company career portals hosted by applicant tracking systems (ATS) like Ashby, Greenhouse, and Lever. Job Radar queries those portals directly through their public JSON APIs, then scores each posting against your resume, entirely in the browser.
+Job Radar searches public applicant-tracking-system APIs across a configurable company watchlist, normalizes the results, and ranks each role based on a candidate’s experience.
 
-## What it does
+It runs in the browser and can be deployed as a static site. No account or application backend is required.
 
-1. **Resume understanding.** Drop in a PDF (parsed with pdf.js) or plain text. By default the app extracts weighted keywords locally: it strips contact info and dates, then builds unigrams and **line-aware bigrams** — phrases are only formed *within* a line/segment, so `M.S. Information Science, Princeton` no longer yields junk like "science princeton". With an Anthropic API key, **AI profile extraction** takes over as the primary path: one Claude call returns a structured profile (weighted skills, domains, likely next titles, seniority, years of experience, a short summary), which becomes your keyword chips and auto-fills target titles. Either way, nothing leaves your device unless you opt into an AI feature.
-2. **Board scanning.** For every company on your watchlist, Job Radar hits the public job board API for that company's ATS and normalizes postings into one shape: company, title, location, compensation, description, posting date, apply link. The seed watchlist is **verified live** — run `npm run verify` to re-check every board (see below).
-3. **Ranking — retrieve, then rerank (three tiers).** Job Radar uses the standard retrieval-and-rerank pattern: a cheap pass narrows the field, then progressively better rankers order the survivors. Each tier is optional-additive; Tier 1 always runs.
-   - **Tier 1 — retrieval (TF-IDF, always on, local & free).** A keyword overlap runs over the *entire* scan. Every keyword is weighted by how rare it is across the scanned jobs (`idf = ln(1 + N/(1+df))`), so ubiquitous terms like "data" or "team" contribute almost nothing while rare, specific terms dominate. Title matches count 4× description matches; optional target titles add exact/partial-credit boosts. Scores normalize so **100 = the best fit in today's scan**. This tier selects the top-N candidates (default 60, adjustable 20–150).
-   - **Tier 2 — local embeddings ("Semantic boost", optional, no key).** Toggle it on and Job Radar lazy-loads a small MiniLM sentence-embedding model (`Xenova/all-MiniLM-L6-v2`, ~25 MB, downloaded once and cached by the browser) via transformers.js. It embeds your résumé and the top ~400 candidates and blends `0.5 · cosine + 0.5 · normalized TF-IDF` into the keyword-stage score — semantic matching with **zero API cost**. If the model fails to load it falls back silently to TF-IDF.
-   - **Tier 3 — LLM rerank ("Smart rank", optional, API key).** Paste your own Anthropic API key and Claude scores the top-N candidates against your **full résumé text plus the structured profile** — judging seniority match, domain overlap, transferable skills, and trajectory (a sensible next role, not just keyword overlap) — returning a 0–100 fit score and a one-line reason per job. When present, the AI score becomes the primary ranking and the keyword score is demoted to a secondary badge.
-   - **Deep Scan — the maximum-quality cascade (optional, API key, expensive by design).** For when you want the best possible shortlist and are willing to spend credits. A four-stage cascade — see below.
-4. **Filtering.** Remote-only, has-compensation, minimum score (applied to whichever score is primary), and free-text filters.
+## Why I built it
 
-### Deep Scan — retrieve → screen → deep read → tournament
+Relevant roles are often buried across individual company career pages and may never appear in a job seeker’s feed at the right time.
 
-Deep Scan is the deliberately expensive path: it spends real API credits to get a hand-recruiter-quality shortlist. Every call uses `claude-sonnet-5`, direct from the browser. The cascade is designed so cost is spent where it matters — breadth first with cheap passes, depth only on the survivors:
+Checking those pages manually is slow. Traditional job aggregators also tend to rank roles using generic search terms rather than the candidate’s actual background.
 
-| Stage | What it does | Scope | Cost |
-|---|---|---|---|
-| **0 · Pool** | Union of the top 1500 by TF-IDF, top 1500 by local embeddings (if Semantic boost ran), and every job whose title matches a target title. Deduped. | ~up to 2000 jobs | Local, free |
-| **1 · Screen** | Claude scores the whole pool (compact job data) to kill obvious non-fits. Batches of ~40, 4 concurrent, 429-backoff. | pool → **top 150** | Cheap-ish |
-| **2 · Deep read** | Full job descriptions (~4000 chars) + your **full résumé**. Returns score, `fit_reasons`, `gaps`, `comp_check`, and an `apply_angle` per job, with instructions to be skeptical (scores > 85 are rare). Batches of ~8, 3 concurrent. | 150 → survivors | The bulk of the spend |
-| **3 · Tournament** | One comparative call ranks the **top 30** against each other for *you specifically* (absolute scores drift between batches; comparison fixes it), assigning a rank + tier. | top 30 | One call |
+Job Radar turns that process into a repeatable pipeline:
 
-Results are presented in three tiers — **Apply now**, **Strong**, **Worth a look** — each card showing rank, fit score, `fit_reasons` (bullets), `gaps` (muted), the `apply_angle` (italic), and a `comp_check` badge. Everything outside the shortlist stays keyword-ranked below. **"Download shortlist (CSV)"** exports the tiered results (company, title, location, comp, tier, rank, score, apply_angle, url).
+1. Parse a resume.
+2. Scan company job boards directly.
+3. Normalize postings from different ATS providers.
+4. Retrieve the most relevant roles.
+5. Rerank the strongest candidates.
+6. Explain the fit, gaps, and suggested application angle.
 
-**Cost.** You see a rough estimate (from pool size and token accounting) and confirm **before** anything runs. As a ballpark, a full scan pool of ~1500–2000 jobs runs on the order of a few US dollars, dominated by Stage 2's full-description reads. Every stage output is **cached in `localStorage` by résumé-hash + job id**, so an interrupted or re-run Deep Scan only pays for what's new. Per-batch failures are non-fatal — the cascade keeps going and notes what was skipped.
+## Core features
 
-### AI features — privacy & cost
+### Direct ATS scanning
 
-Tier 1 and Tier 2 are **fully local** (Tier 2 downloads a model but runs inference in your browser — no data leaves the device). The Claude-powered features (AI profile extraction, Smart rank, and Deep Scan) are the **only** ones that send data off your device:
+Job Radar queries the public job-board APIs used by:
 
-- Requests go **directly from your browser to the Anthropic API** — there is still no backend.
-- Your API key is held in **memory only** (React state), never written to `localStorage`.
-- In these modes your **full résumé text** — and a view of the candidate jobs (Smart rank: first ~800 chars of description; Deep Scan Stage 2: up to ~4000 chars) — are sent to Anthropic.
-- Results are cached locally, keyed to your résumé, so re-runs and reloads don't re-bill; **"Clear AI cache"** resets the profile, Smart-rank scores, and all Deep Scan stage caches.
+* Ashby
+* Greenhouse
+* Lever
+* Recruitee
+* SmartRecruiters
+* Breezy
+* Workable
 
-## Supported ATS platforms
+Each provider exposes a different schema. Job Radar converts the results into a common job format containing fields such as:
 
-Every platform below exposes a public, **CORS-enabled** per-company JSON endpoint intended for embedding job boards — verified from a browser context. No keys, no scraping, no rate-limit games. Seed counts are from the last `npm run discover` run.
+* company;
+* title;
+* location;
+* compensation;
+* description;
+* posting date;
+* application URL.
 
-| Platform | Endpoint | CORS | Compensation | Seed |
-|---|---|---|---|---|
-| Ashby | `api.ashbyhq.com/posting-api/job-board/{slug}` | ✅ `*` | Structured (`compensationTierSummary`) | 382 |
-| Greenhouse | `boards-api.greenhouse.io/v1/boards/{slug}/jobs` | ✅ | Extracted from description text | 110 |
-| Lever | `api.lever.co/v0/postings/{slug}` | ✅ | Structured (`salaryRange`) when present, else extracted | 39 |
-| Recruitee | `{slug}.recruitee.com/api/offers/` | ✅ (reflects origin) | Structured (`salary`) when present | 2 |
-| SmartRecruiters | `api.smartrecruiters.com/v1/companies/{slug}/postings` | ✅ | Not in list endpoint | 2 |
-| Breezy | `{slug}.breezy.hr/json` | ✅ `*` | `salary` field when present | 2 |
-| Workable | `apply.workable.com/api/v1/widget/accounts/{slug}` | ✅ | Extracted from description text | 1 |
+The bundled watchlist includes hundreds of verified company boards and can be edited inside the application.
 
-**538 verified companies** total. Ashby dominates because it's the ATS of choice for the YC/AI-startup cohort the discovery pipeline draws from.
+### Local resume parsing
 
-### Platforms evaluated but not included
+Users can upload a PDF or paste resume text directly.
 
-| Platform | Why not |
-|---|---|
-| **Personio** (`{slug}.jobs.personio.de/search.json`) | Aggressive server-side rate-limiting — returns `429` to programmatic requests even when spaced seconds apart — and sends **no CORS headers**, so it can't be called from a browser. |
-| **Workday** | No public cross-origin API at all; can't be queried from a static client-side app. The main item on the roadmap below. |
+The default parsing pipeline runs locally in the browser. It:
+
+* extracts PDF text with `pdf.js`;
+* removes contact information and dates;
+* identifies weighted keywords and phrases;
+* detects likely target titles;
+* generates a structured profile for ranking.
+
+Line-aware phrase extraction reduces false matches caused by unrelated terms appearing next to one another in raw PDF output.
+
+### Multi-stage job ranking
+
+Job Radar uses a retrieve-then-rerank architecture. Lightweight methods evaluate the complete job pool before more expensive methods inspect the strongest candidates.
+
+#### Keyword retrieval
+
+Always available, local, and free.
+
+A TF-IDF-style ranker scores every role against the extracted resume profile. Specific and uncommon terms receive more weight than generic language, while title matches receive additional emphasis.
+
+This stage reduces the full scan to a smaller candidate pool.
+
+#### Local semantic ranking
+
+Optional, local, and free.
+
+Job Radar can load a compact MiniLM embedding model through `transformers.js`. Resume and job embeddings are combined with the keyword score to identify relevant roles that use different terminology.
+
+The model is downloaded once and cached by the browser.
+
+#### LLM reranking
+
+Optional and bring-your-own-key.
+
+Claude evaluates the strongest candidates using the full resume and structured profile. It considers:
+
+* seniority;
+* domain overlap;
+* transferable experience;
+* missing qualifications;
+* whether the position represents a plausible next step.
+
+Each role receives a fit score and a concise explanation.
+
+## Deep Scan
+
+Deep Scan is the highest-quality ranking path.
+
+Rather than send every full job description to an LLM, it uses a staged cascade:
+
+| Stage      | Purpose                                                |
+| ---------- | ------------------------------------------------------ |
+| Retrieve   | Combine keyword, semantic, and target-title candidates |
+| Screen     | Remove obvious mismatches using compact job data       |
+| Deep read  | Evaluate the strongest roles using full descriptions   |
+| Tournament | Compare the finalists against one another              |
+
+This structure concentrates inference cost on the roles most likely to matter.
+
+Deep Scan can return:
+
+* reasons for fit;
+* material qualification gaps;
+* compensation assessment;
+* a suggested application angle;
+* comparative ranking;
+* recommendation tier.
+
+Batching, bounded concurrency, retry handling, and local caching allow the scan to continue when individual requests fail or rate limits occur.
+
+## Privacy
+
+Job Radar has no application backend.
+
+The keyword ranker and optional embedding model operate locally. Resume data does not leave the browser unless the user enables a Claude-powered feature.
+
+When AI features are enabled:
+
+* requests go directly from the browser to the Anthropic API;
+* the API key is stored in memory rather than `localStorage`;
+* resume text and relevant job information are sent to Anthropic;
+* completed results are cached locally to reduce duplicate API calls.
+
+Users can clear the AI cache from the application.
 
 ## Architecture
 
-```
+```text
 src/
-  lib/
-    ats.js      7 ATS adapters → normalized job shape + bounded-concurrency scanner
-    resume.js   pdf.js text extraction + line-aware keyword/phrase weighting
-    match.js    Tier 1 — TF-IDF retrieval and scoring
-    embed.js    Tier 2 — local MiniLM embeddings (lazy, code-split)
-    ai.js       Tier 3 — Claude profile extraction + Smart-rank scoring
-    deepscan.js Deep Scan — 4-stage retrieve→screen→deep-read→tournament cascade
-  data/
-    companies.json   verified seed watchlist (editable in-app, persisted to localStorage)
-  App.jsx       UI: upload, watchlist manager, streaming scan, three-tier ranked results
+├── lib/
+│   ├── ats.js          ATS adapters, normalization, and concurrent scanning
+│   ├── resume.js       PDF parsing and local profile extraction
+│   ├── match.js        TF-IDF retrieval and scoring
+│   ├── embed.js        Local MiniLM semantic ranking
+│   ├── ai.js           Claude profile extraction and reranking
+│   └── deepscan.js     Multi-stage Deep Scan cascade
+├── data/
+│   └── companies.json  Verified company-board watchlist
+└── App.jsx             Application interface and state management
+
 scripts/
-  discover-boards.mjs   build-time company discovery (npm run discover)
-  verify-boards.mjs     live board checker (npm run verify)
+├── discover-boards.mjs Discover and validate additional job boards
+└── verify-boards.mjs   Recheck the bundled watchlist
 ```
 
-Static React app (Vite). State persists in localStorage (best-effort — a huge watchlist that exceeds the quota degrades gracefully to no-persistence). transformers.js and the embedding model are dynamically imported so they stay out of the main bundle. Deploys to GitHub Pages via the included workflow.
+### Stack
 
-### Scanning at scale
+* React
+* Vite
+* JavaScript
+* `pdf.js`
+* Hugging Face `transformers.js`
+* Anthropic API
+* GitHub Actions
+* GitHub Pages
 
-`scanCompanies` runs boards through a **bounded concurrency pool** (default 12 in flight) rather than firing hundreds of `fetch`es at once, and **streams results into the UI** as each board resolves (flushed ~every 400 ms) so a large scan fills in progressively while the scan button shows live `done/total` progress. The company panel has a filter box (the list can be hundreds long), and the errors panel collapses to an "N boards failed" summary you can expand.
+## Operational design
 
-## Run it
+Large-scale scanning introduces several practical problems beyond basic API integration.
+
+### Bounded concurrency
+
+Job Radar scans boards through a concurrency pool rather than sending hundreds of requests simultaneously.
+
+Results stream into the interface as boards resolve. This reduces browser load, limits avoidable request failures, and gives users visible progress during large scans.
+
+### Provider normalization
+
+ATS platforms differ in:
+
+* endpoint structure;
+* pagination;
+* compensation fields;
+* job-description formatting;
+* location representation;
+* error behavior.
+
+Each adapter converts its provider’s response into the same internal schema. Filtering and ranking therefore operate independently of the original ATS.
+
+### Graceful degradation
+
+Optional features fail independently:
+
+* if the local embedding model cannot load, ranking falls back to keyword retrieval;
+* if an AI batch fails, the rest of the cascade continues;
+* if browser storage is unavailable or full, the application remains usable without persistence;
+* failed company boards are reported without stopping the overall scan.
+
+### Cost control
+
+The application avoids running expensive inference across the entire job pool.
+
+It uses:
+
+* local retrieval before API calls;
+* staged candidate reduction;
+* compact data during initial screening;
+* full descriptions only for finalists;
+* result caching keyed to the resume and job.
+
+Users see an estimated cost before running Deep Scan.
+
+## Run locally
 
 ```bash
+git clone https://github.com/mkelzubeir/job-radar.git
+cd job-radar
 npm install
 npm run dev
 ```
 
-## Company discovery & verification
+Open the local Vite URL shown in the terminal.
 
-The bundled watchlist in `src/data/companies.json` is **generated and verified** by two maintainer scripts — the app itself ships only the static JSON.
-
-**Discover** — probe public sources and rebuild the list:
+### Available commands
 
 ```bash
-npm run discover              # full run (rewrites companies.json)
-node scripts/discover-boards.mjs --limit 200   # probe first 200 candidates
-node scripts/discover-boards.mjs --dry         # report only, don't write
+npm run build       # Create a production build
+npm run preview     # Preview the production build
+npm run lint        # Run oxlint
+npm run verify      # Verify the bundled company boards
+npm run discover    # Discover and rebuild the board watchlist
 ```
 
-It pulls candidate companies from the [YC company directory](https://github.com/yc-oss/api) (filtered to those actively hiring) plus a public GitHub list of ATS board URLs, generates slug guesses (YC slug, website domain, cleaned/dashed name), and probes Ashby → Greenhouse → Lever live through a concurrency pool (first verified hit with open jobs wins). Recruitee/Breezy boards come from the GitHub list and a small curated set. Results merge with the existing verified seed (deduped by `ats:slug`, existing names preferred), 0-job boards are dropped, and it prints per-ATS counts.
+## Add a company
 
-**Verify** — re-check every board in the current list:
+Select the company’s ATS and enter the board slug, usually the final portion of its career-page URL.
+
+### Ashby
+
+```text
+jobs.ashbyhq.com/openai
+ATS: Ashby
+Slug: openai
+```
+
+### Greenhouse
+
+```text
+boards.greenhouse.io/anthropic
+ATS: Greenhouse
+Slug: anthropic
+```
+
+### Lever
+
+```text
+jobs.lever.co/palantir
+ATS: Lever
+Slug: palantir
+```
+
+A failed scan usually means the company changed its slug or migrated to another ATS.
+
+## Discover and verify boards
+
+The bundled company watchlist is maintained through two scripts.
+
+### Discover boards
+
+```bash
+npm run discover
+```
+
+The discovery script gathers candidate companies, generates likely board slugs, probes supported ATS providers, removes duplicates, and retains verified boards with open positions.
+
+For a smaller run:
+
+```bash
+node scripts/discover-boards.mjs --limit 200
+```
+
+To inspect results without rewriting the watchlist:
+
+```bash
+node scripts/discover-boards.mjs --dry
+```
+
+### Verify the watchlist
 
 ```bash
 npm run verify
 ```
 
-Prints each board's HTTP status and open-job count and exits non-zero if any board 404s or returns zero jobs. Probe one ad-hoc board with `node scripts/verify-boards.mjs ashby openai`.
+The verification script checks every saved board and reports its current status and job count.
 
-To refresh the watchlist: `npm run discover`, then `npm run verify` to confirm it's 100% green, then commit the updated `companies.json`.
+To probe a single board:
 
-## Deploy your own (free)
+```bash
+node scripts/verify-boards.mjs ashby openai
+```
 
-1. Fork or clone this repo, push to GitHub.
-2. In repo settings → Pages, set Source to **GitHub Actions**.
-3. Push to `main`. The included workflow builds and deploys automatically.
+## Deploy with GitHub Pages
 
-Anyone with the URL can use it with their own resume and their own company watchlist — nothing is shared between users because nothing is stored server-side.
+1. Fork or clone the repository.
+2. Push it to GitHub.
+3. Open **Settings → Pages**.
+4. Set the source to **GitHub Actions**.
+5. Push to `main`.
 
-## Adding companies
+The included workflow builds and deploys the application automatically.
 
-In the app, add a company by picking its ATS and entering its board slug — the last part of its careers URL:
+Because the application has no backend, each user supplies their own resume, watchlist, and optional API key. Data is not shared between users.
 
-- `jobs.ashbyhq.com/openai` → ATS: Ashby, slug: `openai`
-- `boards.greenhouse.io/anthropic` → ATS: Greenhouse, slug: `anthropic`
-- `jobs.lever.co/palantir` → ATS: Lever, slug: `palantir`
+## Limitations
 
-If a scan shows an error for a company, the slug is usually wrong or the company changed ATS providers.
+* Workday does not expose a browser-accessible public API and is not currently supported.
+* Company boards can change slugs or ATS providers without notice.
+* Resume-to-job scores are prioritization signals, not hiring predictions.
+* Compensation availability depends on the source posting.
+* LLM-generated rankings can miss non-obvious fit or overvalue language similarity.
 
 ## Roadmap
 
-- Workday support via a small serverless proxy
-- New-since-last-scan diffing and notifications
-- Export shortlist to CSV
+* Workday support through a lightweight serverless proxy
+* New-since-last-scan detection
+* Saved searches and recurring scans
+* An evaluation set for measuring ranking quality
+* Improved location and compensation normalization
+* Side-by-side comparison of shortlisted roles
 
 ## License
 
