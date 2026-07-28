@@ -2,7 +2,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { ADAPTERS, scanCompanies } from "./lib/ats";
 import { extractResumeText, extractKeywords } from "./lib/resume";
 import { rankJobs } from "./lib/match";
-import { semanticRank, clearAiCache } from "./lib/ai";
+import { semanticRank, clearAiCache, extractProfile } from "./lib/ai";
 import seedCompanies from "./data/companies.json";
 
 const LS = {
@@ -15,7 +15,9 @@ const LS = {
 };
 
 // Bump when companies.json changes so returning users get new seed entries.
-const SEED_VERSION = 2;
+// v3: verified every board live; fixed 7 slugs/ATSs, dropped 5 unverifiable.
+// v4: mass discovery via npm run discover — ~538 verified boards, +recruitee/breezy.
+const SEED_VERSION = 4;
 
 const load = (k, fallback) => {
   try {
@@ -23,6 +25,20 @@ const load = (k, fallback) => {
     return v ? JSON.parse(v) : fallback;
   } catch {
     return fallback;
+  }
+};
+
+// A huge watchlist can blow the localStorage quota — persist best-effort and
+// swallow quota errors so the app keeps working (just without persistence).
+let quotaWarned = false;
+const save = (k, value) => {
+  try {
+    localStorage.setItem(k, JSON.stringify(value));
+  } catch {
+    if (!quotaWarned) {
+      quotaWarned = true;
+      console.warn(`localStorage full — "${k}" not persisted this session.`);
+    }
   }
 };
 
@@ -66,6 +82,7 @@ const timeAgo = (iso) => {
 export default function App() {
   const [companies, setCompanies] = useState(loadCompanies);
   const [keywords, setKeywords] = useState(() => load(LS.keywords, []));
+  const [aiKeywords, setAiKeywords] = useState(false); // chips came from AI profile
   const [targetTitles, setTargetTitles] = useState(() => load(LS.titles, ""));
   const [resumeText, setResumeText] = useState(() => load(LS.resumeText, ""));
   const [resumeName, setResumeName] = useState("");
@@ -75,7 +92,12 @@ export default function App() {
   const [progress, setProgress] = useState([0, 0]);
   const [scannedAt, setScannedAt] = useState(null);
 
-  // Smart rank (Stage 2). The API key lives ONLY in state — never persisted.
+  // AI profile (Claude) — cached in ai.js by résumé hash.
+  const [profile, setProfile] = useState(null);
+  const [profileBusy, setProfileBusy] = useState(false);
+  const [profileErr, setProfileErr] = useState(null);
+
+  // Smart rank (Stage 3). The API key lives ONLY in state — never persisted.
   const [aiKey, setAiKey] = useState("");
   const [candidateCount, setCandidateCount] = useState(() => load(LS.candidates, 60));
   const [aiScores, setAiScores] = useState(() => new Map());
@@ -84,6 +106,14 @@ export default function App() {
   const [aiError, setAiError] = useState(null);
   const [aiWarnings, setAiWarnings] = useState([]);
 
+  // Semantic boost (Stage 2) — optional local embeddings, no API key.
+  const [semBoost, setSemBoost] = useState(false);
+  const [semScores, setSemScores] = useState(() => new Map());
+  const [semBusy, setSemBusy] = useState(false);
+  const [semProgress, setSemProgress] = useState([0, 0]);
+  const [semWarn, setSemWarn] = useState(null);
+  const embedCacheRef = useRef(new Map());
+
   // Filters
   const [q, setQ] = useState("");
   const [remoteOnly, setRemoteOnly] = useState(false);
@@ -91,24 +121,61 @@ export default function App() {
   const [minMatch, setMinMatch] = useState(0);
   const [expanded, setExpanded] = useState(null);
 
-  // Add-company form
+  // Add-company form + watchlist filter + collapsible errors
   const [newCo, setNewCo] = useState({ name: "", ats: "ashby", slug: "" });
+  const [coFilter, setCoFilter] = useState("");
+  const [errorsOpen, setErrorsOpen] = useState(false);
   const fileRef = useRef(null);
   const importRef = useRef(null);
 
-  useEffect(() => localStorage.setItem(LS.companies, JSON.stringify(companies)), [companies]);
-  useEffect(() => localStorage.setItem(LS.keywords, JSON.stringify(keywords)), [keywords]);
-  useEffect(() => localStorage.setItem(LS.titles, JSON.stringify(targetTitles)), [targetTitles]);
-  useEffect(() => localStorage.setItem(LS.resumeText, JSON.stringify(resumeText)), [resumeText]);
-  useEffect(() => localStorage.setItem(LS.candidates, JSON.stringify(candidateCount)), [candidateCount]);
+  useEffect(() => save(LS.companies, companies), [companies]);
+  useEffect(() => save(LS.keywords, keywords), [keywords]);
+  useEffect(() => save(LS.titles, targetTitles), [targetTitles]);
+  useEffect(() => save(LS.resumeText, resumeText), [resumeText]);
+  useEffect(() => save(LS.candidates, candidateCount), [candidateCount]);
+
+  // A new scan invalidates the per-scan embedding cache and any boost scores.
+  useEffect(() => {
+    embedCacheRef.current = new Map();
+    setSemScores(new Map());
+  }, [jobs]);
+
+  // Turn the résumé into a structured profile (primary path when a key exists).
+  async function runProfile(text) {
+    if (!aiKey.trim() || !text) return;
+    setProfileBusy(true);
+    setProfileErr(null);
+    try {
+      const p = await extractProfile(text, aiKey.trim());
+      setProfile(p);
+      const kws = [
+        ...p.skills.map((s) => ({ term: s.term, weight: s.weight })),
+        ...p.domains.map((d) => ({ term: d, weight: 6 })),
+      ].filter((k) => k.term);
+      if (kws.length) {
+        setKeywords(kws);
+        setAiKeywords(true);
+      }
+      if (!targetTitles.trim() && p.titles.length) {
+        setTargetTitles(p.titles.join(", "));
+      }
+    } catch (e) {
+      setProfileErr(e.message);
+    } finally {
+      setProfileBusy(false);
+    }
+  }
 
   async function onResume(file) {
     if (!file) return;
     setResumeName(file.name);
+    setProfile(null);
+    setAiKeywords(false);
     try {
       const text = await extractResumeText(file);
       setResumeText(text);
-      setKeywords(extractKeywords(text));
+      setKeywords(extractKeywords(text)); // keyless fallback; AI overrides below
+      if (aiKey.trim()) runProfile(text);
     } catch (e) {
       setErrors((prev) => [...prev, { company: "Resume", ats: "-", message: e.message }]);
     }
@@ -117,11 +184,29 @@ export default function App() {
   async function scan() {
     setScanning(true);
     setErrors([]);
+    setJobs([]);
     setProgress([0, companies.length]);
-    const { jobs: found, errors: errs } = await scanCompanies(companies, (d, t) =>
-      setProgress([d, t])
-    );
-    setJobs(found);
+
+    // Stream jobs into the UI as boards resolve, flushing at most ~every 400ms
+    // so a scan of hundreds of companies feels alive without thrashing React.
+    const acc = [];
+    let lastFlush = 0;
+    const flush = () => setJobs(acc.slice());
+
+    const { errors: errs } = await scanCompanies(companies, {
+      concurrency: 12,
+      onProgress: (d, t) => setProgress([d, t]),
+      onJobs: (res) => {
+        acc.push(...res);
+        const now = Date.now();
+        if (now - lastFlush > 400) {
+          lastFlush = now;
+          flush();
+        }
+      },
+    });
+
+    flush(); // final flush (ranking recomputes here on the full set)
     setErrors(errs);
     setScannedAt(new Date());
     setScanning(false);
@@ -129,18 +214,70 @@ export default function App() {
 
   const titlesArr = targetTitles.split(",").map((s) => s.trim()).filter(Boolean);
 
+  // Distinct ATS platforms in the current watchlist — drives the hero copy.
+  const atsCount = new Set(companies.map((c) => c.ats)).size;
+
+  // Watchlist filter (the list can be hundreds long).
+  const coFilterLc = coFilter.trim().toLowerCase();
+  const filteredCompanies = coFilterLc
+    ? companies.filter(
+        (c) =>
+          c.name.toLowerCase().includes(coFilterLc) ||
+          c.slug.toLowerCase().includes(coFilterLc) ||
+          (ADAPTERS[c.ats]?.label || c.ats).toLowerCase().includes(coFilterLc)
+      )
+    : companies;
+
   // Stage 1 (retrieval): TF-IDF over the whole scan.
   const ranked = useMemo(
     () => rankJobs(jobs, keywords, titlesArr),
     [jobs, keywords, targetTitles] // eslint-disable-line react-hooks/exhaustive-deps
   );
 
+  // Stage 2 (optional): blend local embeddings into the keyword-stage score.
+  useEffect(() => {
+    if (!semBoost || !resumeText || !ranked.length) return;
+    let cancelled = false;
+    (async () => {
+      setSemBusy(true);
+      setSemWarn(null);
+      setSemProgress([0, 0]);
+      try {
+        const { semanticBoost } = await import("./lib/embed");
+        const candidates = ranked.slice(0, 400);
+        const scores = await semanticBoost(
+          resumeText,
+          candidates,
+          embedCacheRef.current,
+          (d, t) => !cancelled && setSemProgress([d, t])
+        );
+        if (!cancelled) setSemScores(scores);
+      } catch {
+        if (!cancelled) {
+          setSemWarn("Semantic boost unavailable (model failed to load) — using keyword ranking.");
+          setSemBoost(false);
+        }
+      } finally {
+        if (!cancelled) setSemBusy(false);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [semBoost, ranked, resumeText]);
+
+  // Effective keyword-stage score = blended (if boost active) else TF-IDF.
+  const boosted = useMemo(() => {
+    if (!semBoost || !semScores.size) return ranked;
+    return ranked.map((j) => ({ ...j, match: semScores.get(j.id) ?? j.match }));
+  }, [ranked, semBoost, semScores]);
+
   const withAi = useMemo(
-    () => ranked.map((j) => ({ ...j, ai: aiScores.get(String(j.id)) || null })),
-    [ranked, aiScores]
+    () => boosted.map((j) => ({ ...j, ai: aiScores.get(String(j.id)) || null })),
+    [boosted, aiScores]
   );
 
-  // The primary score is the AI score when present, else the keyword match.
+  // The primary score is the AI score when present, else the keyword score.
   const primaryScore = (j) => (j.ai ? j.ai.score : j.match);
 
   const visible = withAi.filter((j) => {
@@ -154,7 +291,7 @@ export default function App() {
     return true;
   });
 
-  // AI-scored jobs first (by AI score), then unscored jobs by keyword match.
+  // AI-scored jobs first (by AI score), then unscored jobs by keyword score.
   const shown = [...visible].sort((a, b) => {
     if (!!a.ai !== !!b.ai) return a.ai ? -1 : 1;
     if (a.ai && b.ai) return b.ai.score - a.ai.score || b.match - a.match;
@@ -221,12 +358,12 @@ export default function App() {
     setAiWarnings([]);
     setAiProgress([0, 0]);
     try {
-      const candidates = ranked.slice(0, candidateCount);
+      const candidates = boosted.slice(0, candidateCount);
       const { scores, warnings } = await semanticRank(
         resumeText,
         candidates,
         aiKey.trim(),
-        { onProgress: (d, t) => setAiProgress([d, t]) }
+        { onProgress: (d, t) => setAiProgress([d, t]), profile }
       );
       setAiScores(scores);
       setAiWarnings(warnings);
@@ -242,6 +379,7 @@ export default function App() {
     setAiScores(new Map());
     setAiWarnings([]);
     setAiError(null);
+    setProfile(null);
   }
 
   const hasScores = keywords.length + titlesArr.length > 0;
@@ -256,8 +394,8 @@ export default function App() {
             </h1>
             <p>
               Upload a resume, scan the hidden job boards of {companies.length} companies
-              across five ATS platforms, and get every open role ranked against you.
-              Everything runs in your browser.
+              across {atsCount} ATS {atsCount === 1 ? "platform" : "platforms"}, and get
+              every open role ranked against you. Everything runs in your browser.
             </p>
           </div>
           <button className="scan-btn" onClick={scan} disabled={scanning}>
@@ -282,16 +420,38 @@ export default function App() {
               <button className="upload" onClick={() => fileRef.current.click()}>
                 {resumeName ? `↻ ${resumeName}` : "Upload PDF or TXT"}
               </button>
+              {resumeText && (
+                <button
+                  className="wl-btn analyze-btn"
+                  onClick={() => runProfile(resumeText)}
+                  disabled={!aiKey.trim() || profileBusy}
+                  title={aiKey.trim() ? "" : "Add an API key in Smart rank first"}
+                >
+                  {profileBusy
+                    ? "Analyzing…"
+                    : profile
+                    ? "↻ Re-analyze with AI"
+                    : "Analyze with AI"}
+                </button>
+              )}
               <p className="hint">
-                Parsed locally with pdf.js — your resume stays on this device unless
-                you use Smart rank (see below).
+                Parsed locally with pdf.js. With an API key, "Analyze with AI"
+                extracts a structured profile; otherwise keywords are pulled locally.
               </p>
+              {profileErr && <p className="ai-err">{profileErr}</p>}
+              {profile && (
+                <p className="hint profile-line">
+                  AI profile: {profile.seniority || "—"}
+                  {profile.years_experience ? ` · ${profile.years_experience}y` : ""}
+                  {profile.summary ? ` — ${profile.summary}` : ""}
+                </p>
+              )}
               {keywords.length > 0 && (
                 <div className="chips">
                   {keywords.slice(0, 24).map((k) => (
                     <button
                       key={k.term}
-                      className="chip"
+                      className={`chip${aiKeywords ? " chip-ai" : ""}`}
                       title="Remove"
                       onClick={() => removeKeyword(k.term)}
                     >
@@ -316,15 +476,32 @@ export default function App() {
             {/* Companies */}
             <section className="card">
               <h3>3 · Companies ({companies.length})</h3>
+              <input
+                className="co-search"
+                placeholder="Filter companies…"
+                value={coFilter}
+                onChange={(e) => setCoFilter(e.target.value)}
+              />
+              {coFilterLc && (
+                <p className="hint co-count">
+                  {filteredCompanies.length} of {companies.length} shown
+                </p>
+              )}
               <ul className="co-list">
-                {companies.map((c, i) => (
-                  <li key={`${c.ats}-${c.slug}-${i}`}>
+                {filteredCompanies.map((c) => (
+                  <li key={`${c.ats}-${c.slug}`}>
                     <span className="co-name">{c.name}</span>
                     <span className="co-ats">{ADAPTERS[c.ats]?.label}</span>
                     <button
                       className="co-x"
                       aria-label={`Remove ${c.name}`}
-                      onClick={() => setCompanies(companies.filter((_, j) => j !== i))}
+                      onClick={() =>
+                        setCompanies(
+                          companies.filter(
+                            (x) => !(x.ats === c.ats && x.slug === c.slug)
+                          )
+                        )
+                      }
                     >
                       ✕
                     </button>
@@ -428,9 +605,9 @@ export default function App() {
               ))}
               <p className="hint">
                 Your key stays in this browser tab (never saved). Calls go directly
-                from here to Anthropic, and in this mode your resume text is sent to
-                the Anthropic API to judge fit. Rough cost scales with the number of
-                candidates.
+                from here to Anthropic, and in this mode your résumé text is sent to
+                the Anthropic API to extract your profile and judge fit. Rough cost
+                scales with the number of candidates.
               </p>
             </section>
           </aside>
@@ -459,6 +636,15 @@ export default function App() {
                 />
                 Has comp
               </label>
+              <label className="check" title="Blend a local embedding model into the keyword score. Downloads a ~25MB model once.">
+                <input
+                  type="checkbox"
+                  checked={semBoost}
+                  onChange={(e) => setSemBoost(e.target.checked)}
+                  disabled={!resumeText || !jobs.length}
+                />
+                Semantic boost{semBusy ? ` (${semProgress[0]}/${semProgress[1]})` : ""}
+              </label>
               <label className="check slider">
                 Match ≥ {minMatch}
                 <input
@@ -472,13 +658,24 @@ export default function App() {
               </label>
             </div>
 
+            {semWarn && <div className="errors sem-warn">{semWarn}</div>}
+
             {errors.length > 0 && (
               <div className="errors">
-                {errors.map((e, i) => (
-                  <span key={i}>
-                    {e.company} ({e.ats}): {e.message}
-                  </span>
-                ))}
+                <button
+                  className="errors-toggle"
+                  onClick={() => setErrorsOpen((o) => !o)}
+                  aria-expanded={errorsOpen}
+                >
+                  {errorsOpen ? "▾" : "▸"} {errors.length} board
+                  {errors.length === 1 ? "" : "s"} failed
+                </button>
+                {errorsOpen &&
+                  errors.map((e, i) => (
+                    <span key={i} className="errors-detail">
+                      {e.company} ({e.ats}): {e.message}
+                    </span>
+                  ))}
               </div>
             )}
 
@@ -526,14 +723,14 @@ export default function App() {
                             {j.ai.score}
                           </div>
                           {hasScores && (
-                            <div className="match match-mini" title="Keyword match">
+                            <div className="match match-mini" title="Keyword score">
                               {j.match}
                             </div>
                           )}
                         </>
                       ) : (
                         hasScores && (
-                          <div className="match" title="Keyword match score">
+                          <div className="match" title="Keyword score">
                             {j.match}
                           </div>
                         )

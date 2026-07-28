@@ -199,27 +199,111 @@ export const ADAPTERS = {
       });
     },
   },
+
+  // Recruitee returns CORS headers reflecting the request origin, so it works
+  // from the browser. Offers carry rich structured fields.
+  recruitee: {
+    label: "Recruitee",
+    boardUrl: (slug) => `https://${slug}.recruitee.com/`,
+    async fetch(slug, company) {
+      const r = await fetch(`https://${slug}.recruitee.com/api/offers/`);
+      if (!r.ok) throw new Error(`Recruitee ${r.status}`);
+      const data = await r.json();
+      return (data.offers || []).map((j) => {
+        const desc = stripHtml(
+          [j.description, j.requirements].filter(Boolean).join("\n")
+        );
+        return norm({
+          id: `rec-${j.id}`,
+          source: "Recruitee",
+          company: company || j.company_name || slug,
+          title: j.title,
+          location: [j.city, j.country].filter(Boolean).join(", "),
+          remote: !!j.remote || /remote/i.test(j.location || ""),
+          comp: j.salary?.min
+            ? `${j.salary.currency || ""}${j.salary.min}–${j.salary.max}`.trim()
+            : compFromText(desc),
+          description: desc,
+          url: j.careers_url || j.careers_apply_url,
+          postedAt: j.published_at || j.created_at || null,
+        });
+      });
+    },
+  },
+
+  // Breezy serves `access-control-allow-origin: *` on its JSON board endpoint.
+  // Non-customer subdomains return a marketing HTML page, so guard on the array.
+  breezy: {
+    label: "Breezy",
+    boardUrl: (slug) => `https://${slug}.breezy.hr/`,
+    async fetch(slug, company) {
+      const r = await fetch(`https://${slug}.breezy.hr/json`);
+      if (!r.ok) throw new Error(`Breezy ${r.status}`);
+      const data = await r.json();
+      if (!Array.isArray(data)) throw new Error("Breezy: no board");
+      return data.map((j) => {
+        const loc = j.location || {};
+        const city = loc.city || "";
+        const country = loc.country?.name || "";
+        return norm({
+          id: `brz-${j.id}`,
+          source: "Breezy",
+          company: company || j.company?.name || slug,
+          title: j.name,
+          location: [city, country].filter(Boolean).join(", "),
+          remote: /remote/i.test(`${loc.name || ""} ${city} ${j.type?.name || ""}`),
+          comp: j.salary || null,
+          description: stripHtml(j.description),
+          url: j.url,
+          postedAt: j.published_date || null,
+        });
+      });
+    },
+  },
 };
 
-/** Fetch all companies concurrently; returns { jobs, errors } */
-export async function scanCompanies(companies, onProgress) {
+/**
+ * Fetch companies through a bounded concurrency pool so a watchlist of hundreds
+ * doesn't open hundreds of sockets at once. Results stream out via `onJobs` as
+ * each board resolves, so the UI can fill in progressively.
+ *
+ * @param companies  [{ name, ats, slug }]
+ * @param opts.onProgress (done, total) => void
+ * @param opts.onJobs     (jobsFromOneBoard) => void   — called per resolved board
+ * @param opts.concurrency default 12
+ * @returns { jobs, errors }
+ */
+export async function scanCompanies(companies, opts = {}) {
+  // Back-compat: a bare function is treated as onProgress.
+  if (typeof opts === "function") opts = { onProgress: opts };
+  const { onProgress, onJobs, concurrency = 12 } = opts;
+
   const jobs = [];
   const errors = [];
+  const total = companies.length;
   let done = 0;
-  await Promise.all(
-    companies.map(async (c) => {
+  let i = 0;
+
+  async function worker() {
+    while (i < total) {
+      const c = companies[i++];
       try {
         const adapter = ADAPTERS[c.ats];
         if (!adapter) throw new Error(`Unknown ATS: ${c.ats}`);
         const res = await adapter.fetch(c.slug, c.name);
         jobs.push(...res);
+        if (res.length) onJobs?.(res);
       } catch (e) {
         errors.push({ company: c.name || c.slug, ats: c.ats, message: e.message });
       } finally {
         done += 1;
-        onProgress?.(done, companies.length);
+        onProgress?.(done, total);
       }
-    })
+    }
+  }
+
+  await Promise.all(
+    Array.from({ length: Math.min(concurrency, total) }, worker)
   );
   return { jobs, errors };
 }

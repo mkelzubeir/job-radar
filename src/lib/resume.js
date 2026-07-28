@@ -69,6 +69,22 @@ const tokenize = (text) =>
 
 const isBad = (w) => STOPWORDS.has(w) || NOISE.has(w) || digitHeavy(w);
 
+// Bigrams must not cross line breaks or these punctuation marks, or they glue
+// unrelated words together ("science princeton" from "M.S. ... Science,
+// Princeton"; "sql ctes" from "SQL (CTEs, ...)"). Split into segments first,
+// then build bigrams only WITHIN a segment.
+const SEG_SPLIT = /[\n,;:()|/•]+/;
+const segmentBigrams = (text, into) => {
+  for (const seg of text.split(SEG_SPLIT)) {
+    const t = tokenize(seg);
+    for (let i = 0; i < t.length - 1; i++) {
+      const a = t[i], b = t[i + 1];
+      if (isBad(a) || isBad(b)) continue;
+      into(`${a} ${b}`);
+    }
+  }
+};
+
 /**
  * Extract weighted keywords: unigrams and bigrams by frequency, with contact
  * info, dates, and boilerplate removed. Returns [{ term, weight }] by weight.
@@ -77,28 +93,21 @@ export function extractKeywords(text, max = 40) {
   const cleaned = preClean(text);
   const tokens = tokenize(cleaned);
 
-  // Unigram occurrence counts (skip pure noise words).
+  // Unigram occurrence counts (skip pure noise words) — unchanged: counted
+  // across the whole token stream.
   const uni = new Map();
   for (const t of tokens) if (!NOISE.has(t)) uni.set(t, (uni.get(t) || 0) + 1);
 
-  // (d) Bigram occurrence counts — skip when either word is noise, a stopword,
-  // or digit-heavy (tokenize already dropped stopwords/digit-heavy tokens).
+  // (d) Bigram occurrence counts, built only within a segment.
   const bi = new Map();
-  for (let i = 0; i < tokens.length - 1; i++) {
-    const a = tokens[i], b = tokens[i + 1];
-    if (isBad(a) || isBad(b)) continue;
-    bi.set(`${a} ${b}`, (bi.get(`${a} ${b}`) || 0) + 1);
-  }
+  segmentBigrams(cleaned, (k) => bi.set(k, (bi.get(k) || 0) + 1));
 
   // (e) The person's name repeats in page headers and slips through as a
   // high-frequency bigram. Drop the top-frequency bigram(s) that also appear in
   // the first 120 chars of the cleaned text, plus any unigram that occurs ONLY
   // inside those bigrams.
-  const headerTokens = tokenize(cleaned.slice(0, 120));
   const headerBigrams = new Set();
-  for (let i = 0; i < headerTokens.length - 1; i++) {
-    headerBigrams.add(`${headerTokens[i]} ${headerTokens[i + 1]}`);
-  }
+  segmentBigrams(cleaned.slice(0, 120), (k) => headerBigrams.add(k));
   const dropBigrams = new Set();
   const nameWordCounts = new Map();
   const headerEntries = [...bi.entries()].filter(([k]) => headerBigrams.has(k));

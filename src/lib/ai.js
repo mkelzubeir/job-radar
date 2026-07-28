@@ -15,6 +15,7 @@ const API_URL = "https://api.anthropic.com/v1/messages";
 // project is to use Sonnet 5. Change here to switch models.
 const MODEL = "claude-sonnet-5";
 const CACHE_KEY = "jobradar.aiScores";
+const PROFILE_KEY = "jobradar.profile";
 const BATCH_SIZE = 20;
 const CONCURRENCY = 3;
 
@@ -53,6 +54,7 @@ function saveCache(obj) {
 export function clearAiCache() {
   try {
     localStorage.removeItem(CACHE_KEY);
+    localStorage.removeItem(PROFILE_KEY);
   } catch {
     /* ignore */
   }
@@ -71,26 +73,32 @@ function extractJsonArray(text) {
   return parsed;
 }
 
-async function scoreBatch(resumeText, batch, apiKey) {
-  const compact = batch.map((j) => ({
-    id: j.id,
-    company: j.company,
-    title: j.title,
-    location: j.location || "",
-    comp: j.comp || "",
-    description: (j.description || "").slice(0, 800),
-  }));
+// Same, for a single { ... } object.
+function extractJsonObject(text) {
+  const t = (text || "").trim();
+  const start = t.indexOf("{");
+  const end = t.lastIndexOf("}");
+  if (start === -1 || end === -1 || end < start) {
+    throw new Error("no JSON object found in response");
+  }
+  const parsed = JSON.parse(t.slice(start, end + 1));
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw new Error("response was not a JSON object");
+  }
+  return parsed;
+}
 
-  const userMsg = [
-    "=== CANDIDATE RESUME ===",
-    resumeText,
-    "",
-    "=== JOBS (JSON) ===",
-    JSON.stringify(compact),
-    "",
-    "Score every job. Return only the JSON array.",
-  ].join("\n");
+const PROFILE_SYSTEM = [
+  "You are an expert technical recruiter. Read the résumé and extract a structured profile.",
+  "Return ONLY JSON, no prose or markdown, shaped exactly:",
+  '{"skills":[{"term":string,"weight":number}], "domains":[string], "titles":[string],',
+  ' "seniority":string, "years_experience":number, "summary":string}',
+  "where skill weight is 1-10 (how central the skill is), titles are 3-6 realistic",
+  "next-role titles, and summary is <= 40 words. Skills should be concrete",
+  "technologies/methods, not soft skills.",
+].join("\n");
 
+async function callClaude(apiKey, system, userMsg, maxTokens = 1500) {
   const res = await fetch(API_URL, {
     method: "POST",
     headers: {
@@ -101,31 +109,119 @@ async function scoreBatch(resumeText, batch, apiKey) {
     },
     body: JSON.stringify({
       model: MODEL,
-      max_tokens: 2000,
-      // Sonnet 5 enables adaptive thinking by default; disable it so the whole
-      // budget goes to the JSON array (this is a scoring task, not reasoning).
+      max_tokens: maxTokens,
       thinking: { type: "disabled" },
-      system: SYSTEM,
+      system,
       messages: [{ role: "user", content: userMsg }],
     }),
   });
-
   if (!res.ok) {
     let detail = String(res.status);
     try {
       const err = await res.json();
       detail = err?.error?.message || detail;
     } catch {
-      /* non-JSON error body — keep the status code */
+      /* non-JSON error body */
     }
     throw new Error(`Anthropic API ${detail}`);
   }
-
   const data = await res.json();
-  const text = (data.content || [])
+  return (data.content || [])
     .filter((b) => b.type === "text")
     .map((b) => b.text)
     .join("");
+}
+
+function loadProfileCache() {
+  try {
+    return JSON.parse(localStorage.getItem(PROFILE_KEY)) || {};
+  } catch {
+    return {};
+  }
+}
+
+/**
+ * Extract a structured candidate profile from the résumé with one Claude call.
+ * Cached in localStorage by résumé hash so it isn't re-billed on reload.
+ * @returns {Promise<{skills:{term:string,weight:number}[], domains:string[], titles:string[], seniority:string, years_experience:number, summary:string}>}
+ */
+export async function extractProfile(resumeText, apiKey) {
+  const hkey = hashText(resumeText);
+  const cache = loadProfileCache();
+  if (cache[hkey]) return cache[hkey];
+
+  const text = await callClaude(
+    apiKey,
+    PROFILE_SYSTEM,
+    `=== RÉSUMÉ ===\n${resumeText}\n\nExtract the profile as JSON only.`
+  );
+  const raw = extractJsonObject(text);
+  const profile = {
+    skills: Array.isArray(raw.skills)
+      ? raw.skills
+          .filter((s) => s && s.term)
+          .map((s) => ({
+            term: String(s.term),
+            weight: Math.max(1, Math.min(10, Number(s.weight) || 5)),
+          }))
+      : [],
+    domains: Array.isArray(raw.domains) ? raw.domains.map(String) : [],
+    titles: Array.isArray(raw.titles) ? raw.titles.map(String) : [],
+    seniority: typeof raw.seniority === "string" ? raw.seniority : "",
+    years_experience: Number(raw.years_experience) || 0,
+    summary: typeof raw.summary === "string" ? raw.summary : "",
+  };
+
+  cache[hkey] = profile;
+  try {
+    localStorage.setItem(PROFILE_KEY, JSON.stringify(cache));
+  } catch {
+    /* quota — profile still returned, just not cached */
+  }
+  return profile;
+}
+
+function profileBlock(profile) {
+  if (!profile) return "";
+  const domains = (profile.domains || []).join(", ");
+  const titles = (profile.titles || []).join(", ");
+  return [
+    "=== CANDIDATE PROFILE (structured) ===",
+    `Seniority: ${profile.seniority || "unknown"}`,
+    `Years of experience: ${profile.years_experience || "unknown"}`,
+    domains && `Domains: ${domains}`,
+    titles && `Likely next roles: ${titles}`,
+    profile.summary && `Summary: ${profile.summary}`,
+    "",
+  ]
+    .filter(Boolean)
+    .join("\n");
+}
+
+async function scoreBatch(resumeText, batch, apiKey, profile) {
+  const compact = batch.map((j) => ({
+    id: j.id,
+    company: j.company,
+    title: j.title,
+    location: j.location || "",
+    comp: j.comp || "",
+    description: (j.description || "").slice(0, 800),
+  }));
+
+  const userMsg = [
+    profileBlock(profile),
+    "=== CANDIDATE RÉSUMÉ ===",
+    resumeText,
+    "",
+    "=== JOBS (JSON) ===",
+    JSON.stringify(compact),
+    "",
+    "Score every job. Return only the JSON array.",
+  ].join("\n");
+
+  // Sonnet 5 enables adaptive thinking by default; callClaude disables it so the
+  // whole budget goes to the JSON array (this is a scoring task, not reasoning).
+  const text = await callClaude(apiKey, SYSTEM, userMsg, 2000);
   return extractJsonArray(text);
 }
 
@@ -138,7 +234,7 @@ async function scoreBatch(resumeText, batch, apiKey) {
  * @returns {Promise<{ scores: Map<string,{score:number,reason:string}>, warnings: string[] }>}
  */
 export async function semanticRank(resumeText, jobs, apiKey, opts = {}) {
-  const { onProgress } = opts;
+  const { onProgress, profile } = opts;
   const hkey = hashText(resumeText);
   const cache = loadCache();
   const scores = new Map();
@@ -165,7 +261,7 @@ export async function semanticRank(resumeText, jobs, apiKey, opts = {}) {
     while (next < batches.length) {
       const batch = batches[next++];
       try {
-        const arr = await scoreBatch(resumeText, batch, apiKey);
+        const arr = await scoreBatch(resumeText, batch, apiKey, profile);
         const byId = new Map(batch.map((j) => [String(j.id), j]));
         for (const r of arr) {
           if (!r || r.id == null) continue;
