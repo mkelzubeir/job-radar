@@ -1,0 +1,16 @@
+[
+  { "name": "OpenAI", "ats": "ashby", "slug": "openai" },
+  { "name": "Anthropic", "ats": "greenhouse", "slug": "anthropic" },
+  { "name": "Scale AI", "ats": "greenhouse", "slug": "scaleai" },
+  { "name": "Cohere", "ats": "ashby", "slug": "cohere" },
+  { "name": "ElevenLabs", "ats": "ashby", "slug": "elevenlabs" },
+  { "name": "Ramp", "ats": "ashby", "slug": "ramp" },
+  { "name": "Linear", "ats": "ashby", "slug": "linear" },
+  { "name": "Notion", "ats": "ashby", "slug": "notion" },
+  { "name": "Replit", "ats": "ashby", "slug": "replit" },
+  { "name": "Figma", "ats": "greenhouse", "slug": "figma" },
+  { "name": "Stripe", "ats": "greenhouse", "slug": "stripe" },
+  { "name": "Databricks", "ats": "greenhouse", "slug": "databricks" },
+  { "name": "Palantir", "ats": "lever", "slug": "palantir" },
+  { "name": "Plaid", "ats": "lever", "slug": "plaid" }
+]
