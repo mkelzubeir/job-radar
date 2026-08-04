@@ -61,6 +61,23 @@ The default parsing pipeline runs locally in the browser. It:
 
 Line-aware phrase extraction reduces false matches caused by unrelated terms appearing next to one another in raw PDF output.
 
+### Persistent scans
+
+Completed scans are saved to IndexedDB (a full scan is tens of megabytes — well past the localStorage quota), so the entire result set survives a page refresh and can be re-filtered instantly without rescanning hundreds of boards.
+
+First-seen tracking carries across scans: roles that appear for the first time in the latest scan are tagged **New**, so a rescan surfaces only what has changed since the last one.
+
+### Structured filtering
+
+Every scanned role is classified from its title and description at load time:
+
+* **Role family** — Engineering, Operations, Strategy & BizOps, Product, Program & Project Mgmt, GTM & Sales, and more. Tri-state chips include or exclude whole families, so keyword overlap can no longer surface role types you would never apply to.
+* **Seniority** — intern through VP/exec, parsed from the title.
+* **Years of experience** — the description's stated requirement ("5+ years of experience", "3–5 years in operations", written numbers included), with range lower bounds treated as the bar to clear. When nothing is stated, seniority implies a floor (Senior ≈ 5, Staff/Principal ≈ 8, Director ≈ 10). A "≤ N years" slider filters on the result, with an option to keep roles that state nothing.
+* **Compensation floor**, **posting recency**, **must-mention** and **exclude-title-word** rules round out the set.
+
+Filters persist across sessions and apply to the saved scan — scan once, slice many ways.
+
 ### Multi-stage job ranking
 
 Job Radar uses a retrieve-then-rerank architecture. Lightweight methods evaluate the complete job pool before more expensive methods inspect the strongest candidates.

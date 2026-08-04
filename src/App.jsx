@@ -11,6 +11,15 @@ import {
   deepScanCSV,
 } from "./lib/deepscan";
 import seedCompanies from "./data/companies.json";
+import { saveScan, loadScan, clearScan } from "./lib/store";
+import {
+  enrichJob,
+  jobPassesFilters,
+  countActiveFilters,
+  DEFAULT_FILTERS,
+  CATEGORY_ORDER,
+  SENIORITY_ORDER,
+} from "./lib/filters";
 
 const LS = {
   companies: "jobradar.companies",
@@ -19,6 +28,7 @@ const LS = {
   resumeText: "jobradar.resumeText",
   seedVersion: "jobradar.seedVersion",
   candidates: "jobradar.candidateCount",
+  filters: "jobradar.filters",
 };
 
 // Bump when companies.json changes so returning users get new seed entries.
@@ -193,6 +203,36 @@ export default function App() {
   const [minMatch, setMinMatch] = useState(0);
   const [expanded, setExpanded] = useState(null);
 
+  // Advanced filters — persisted so they survive refreshes along with the scan.
+  const [flt, setFlt] = useState(() => ({
+    ...DEFAULT_FILTERS,
+    ...load(LS.filters, {}),
+  }));
+  const [fltOpen, setFltOpen] = useState(false);
+  useEffect(() => save(LS.filters, flt), [flt]);
+
+  // Scan persistence: jobs first seen in the latest scan + restore marker.
+  const [newIds, setNewIds] = useState(() => new Set());
+  const [restored, setRestored] = useState(false);
+
+  // On load, restore the last saved scan from IndexedDB so filtering works
+  // immediately without rescanning 549 boards.
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      const s = await loadScan();
+      if (cancelled || !s?.jobs?.length) return;
+      setJobs((cur) => (cur.length ? cur : s.jobs));
+      setScannedAt(s.scannedAt ? new Date(s.scannedAt) : null);
+      setNewIds(new Set(s.newIds || []));
+      if (Array.isArray(s.errors) && s.errors.length) setErrors(s.errors);
+      setRestored(true);
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
   // Add-company form + watchlist filter + collapsible errors
   const [newCo, setNewCo] = useState({ name: "", ats: "ashby", slug: "" });
   const [coFilter, setCoFilter] = useState("");
@@ -286,7 +326,31 @@ export default function App() {
 
     flush(); // final flush (ranking recomputes here on the full set)
     setErrors(errs);
-    setScannedAt(new Date());
+
+    // Persist the whole scan to IndexedDB so it survives refresh and can be
+    // re-filtered without rescanning. firstSeen carries over across scans so
+    // "New" means new-to-you, not just present-in-this-scan.
+    const prev = await loadScan();
+    const nowIso = new Date().toISOString();
+    const prevFirstSeen = prev?.firstSeen || {};
+    const firstSeen = {};
+    const freshIds = [];
+    for (const j of acc) {
+      const seen = prevFirstSeen[j.id] || nowIso;
+      firstSeen[j.id] = seen;
+      if (prev && seen === nowIso) freshIds.push(j.id);
+    }
+    setNewIds(new Set(freshIds));
+    setScannedAt(new Date(nowIso));
+    setRestored(false);
+    saveScan({
+      jobs: acc,
+      scannedAt: nowIso,
+      errors: errs,
+      firstSeen,
+      newIds: freshIds,
+    });
+
     setScanning(false);
   }
 
@@ -306,10 +370,26 @@ export default function App() {
       )
     : companies;
 
+  // Enrich every scanned job once: role category, seniority, parsed years of
+  // experience, comp ceiling. Everything downstream filters on these.
+  const enriched = useMemo(() => jobs.map(enrichJob), [jobs]);
+
+  // Per-category / per-seniority counts shown on the filter chips.
+  const catCounts = useMemo(() => {
+    const m = new Map();
+    for (const j of enriched) m.set(j.category, (m.get(j.category) || 0) + 1);
+    return m;
+  }, [enriched]);
+  const senCounts = useMemo(() => {
+    const m = new Map();
+    for (const j of enriched) m.set(j.seniority, (m.get(j.seniority) || 0) + 1);
+    return m;
+  }, [enriched]);
+
   // Stage 1 (retrieval): TF-IDF over the whole scan.
   const ranked = useMemo(
-    () => rankJobs(jobs, keywords, titlesArr),
-    [jobs, keywords, targetTitles] // eslint-disable-line react-hooks/exhaustive-deps
+    () => rankJobs(enriched, keywords, titlesArr),
+    [enriched, keywords, targetTitles] // eslint-disable-line react-hooks/exhaustive-deps
   );
 
   // Stage 2 (optional): blend local embeddings into the keyword-stage score.
@@ -371,6 +451,7 @@ export default function App() {
     if (remoteOnly && !j.remote) return false;
     if (compOnly && !j.comp) return false;
     if (primaryScore(j) < minMatch) return false; // filter on whichever score is primary
+    if (!jobPassesFilters(j, flt, newIds)) return false;
     if (q) {
       const hay = `${j.company} ${j.title} ${j.location}`.toLowerCase();
       if (!hay.includes(q.toLowerCase())) return false;
@@ -389,6 +470,18 @@ export default function App() {
   });
 
   const removeKeyword = (term) => setKeywords(keywords.filter((k) => k.term !== term));
+
+  // Tri-state chip cycle: neutral → include → exclude → neutral.
+  const cycleChip = (field, key) =>
+    setFlt((f) => {
+      const m = { ...(f[field] || {}) };
+      const next = (m[key] || 0) === 0 ? 1 : m[key] === 1 ? -1 : 0;
+      if (next === 0) delete m[key];
+      else m[key] = next;
+      return { ...f, [field]: m };
+    });
+  const setF = (patch) => setFlt((f) => ({ ...f, ...patch }));
+  const nActiveFilters = countActiveFilters(flt);
   const addCompany = () => {
     if (!newCo.slug.trim()) return;
     setCompanies([
@@ -867,7 +960,165 @@ export default function App() {
                   onChange={(e) => setMinMatch(+e.target.value)}
                 />
               </label>
+              <button
+                className={"flt-toggle" + (nActiveFilters ? " active" : "")}
+                onClick={() => setFltOpen((o) => !o)}
+                aria-expanded={fltOpen}
+              >
+                {fltOpen ? "▾" : "▸"} Filters
+                {nActiveFilters ? ` · ${nActiveFilters}` : ""}
+              </button>
             </div>
+
+            {fltOpen && (
+              <div className="filter-panel">
+                <div className="fp-group">
+                  <span className="fp-label">
+                    Role type <em>click once to include only, twice to exclude</em>
+                  </span>
+                  <div className="fp-chips">
+                    {CATEGORY_ORDER.map((c) => {
+                      const n = catCounts.get(c) || 0;
+                      const st = flt.categories?.[c] || 0;
+                      return (
+                        <button
+                          key={c}
+                          className={
+                            "fchip" + (st === 1 ? " inc" : st === -1 ? " exc" : "")
+                          }
+                          onClick={() => cycleChip("categories", c)}
+                          title={
+                            st === 1
+                              ? "Included — click to exclude"
+                              : st === -1
+                              ? "Excluded — click to clear"
+                              : "Click to include only this type"
+                          }
+                        >
+                          {st === -1 ? "✕ " : st === 1 ? "✓ " : ""}
+                          {c}
+                          {jobs.length ? <b>{n}</b> : null}
+                        </button>
+                      );
+                    })}
+                  </div>
+                </div>
+
+                <div className="fp-group">
+                  <span className="fp-label">Seniority</span>
+                  <div className="fp-chips">
+                    {SENIORITY_ORDER.map(([key, label]) => {
+                      const n = senCounts.get(key) || 0;
+                      const st = flt.seniorities?.[key] || 0;
+                      return (
+                        <button
+                          key={key}
+                          className={
+                            "fchip" + (st === 1 ? " inc" : st === -1 ? " exc" : "")
+                          }
+                          onClick={() => cycleChip("seniorities", key)}
+                        >
+                          {st === -1 ? "✕ " : st === 1 ? "✓ " : ""}
+                          {label}
+                          {jobs.length ? <b>{n}</b> : null}
+                        </button>
+                      );
+                    })}
+                  </div>
+                </div>
+
+                <div className="fp-row">
+                  <label className="check slider fp-years">
+                    Experience required ≤{" "}
+                    {flt.maxYears > 0 ? `${flt.maxYears} yrs` : "any"}
+                    <input
+                      type="range"
+                      min="0"
+                      max="10"
+                      value={flt.maxYears}
+                      onChange={(e) => setF({ maxYears: +e.target.value })}
+                    />
+                  </label>
+                  {flt.maxYears > 0 && (
+                    <label
+                      className="check"
+                      title="Roles whose description states no years requirement. Titles still imply years: Senior ≈ 5, Staff/Principal ≈ 8, Director ≈ 10."
+                    >
+                      <input
+                        type="checkbox"
+                        checked={flt.includeUnknownYears}
+                        onChange={(e) =>
+                          setF({ includeUnknownYears: e.target.checked })
+                        }
+                      />
+                      keep roles that don't state years
+                    </label>
+                  )}
+                </div>
+
+                <div className="fp-row">
+                  <label className="check slider">
+                    Comp reaches ≥{" "}
+                    {flt.minCompK > 0 ? `$${flt.minCompK}k` : "any"}
+                    <input
+                      type="range"
+                      min="0"
+                      max="300"
+                      step="10"
+                      value={flt.minCompK}
+                      onChange={(e) => setF({ minCompK: +e.target.value })}
+                    />
+                  </label>
+                  <label className="check">
+                    Posted within
+                    <select
+                      className="fp-select"
+                      value={flt.postedDays}
+                      onChange={(e) => setF({ postedDays: +e.target.value })}
+                    >
+                      <option value={0}>any time</option>
+                      <option value={7}>7 days</option>
+                      <option value={14}>14 days</option>
+                      <option value={30}>30 days</option>
+                    </select>
+                  </label>
+                  <label
+                    className="check"
+                    title="Only roles that appeared for the first time in your latest scan"
+                  >
+                    <input
+                      type="checkbox"
+                      checked={flt.newOnly}
+                      disabled={!newIds.size}
+                      onChange={(e) => setF({ newOnly: e.target.checked })}
+                    />
+                    New since last scan{newIds.size ? ` (${newIds.size})` : ""}
+                  </label>
+                </div>
+
+                <div className="fp-row">
+                  <input
+                    className="fp-input"
+                    placeholder="Exclude title words — e.g. engineer, scientist"
+                    value={flt.excludeWords}
+                    onChange={(e) => setF({ excludeWords: e.target.value })}
+                  />
+                  <input
+                    className="fp-input"
+                    placeholder="Must mention — e.g. human data, rlhf"
+                    value={flt.mustWords}
+                    onChange={(e) => setF({ mustWords: e.target.value })}
+                  />
+                  <button
+                    className="wl-btn"
+                    onClick={() => setFlt({ ...DEFAULT_FILTERS })}
+                    disabled={!nActiveFilters}
+                  >
+                    Reset filters
+                  </button>
+                </div>
+              </div>
+            )}
 
             {semWarn && <div className="errors sem-warn">{semWarn}</div>}
 
@@ -971,7 +1222,29 @@ export default function App() {
                     : `${visible.length} of ${jobs.length} roles`
                   : "No scan yet"}
               </h2>
-              {scannedAt && <span className="stamp">last scan {scannedAt.toLocaleTimeString()}</span>}
+              {scannedAt && (
+                <span className="stamp">
+                  {restored
+                    ? `saved scan · ${timeAgo(scannedAt.toISOString())}`
+                    : `last scan ${scannedAt.toLocaleTimeString()}`}
+                  {restored && (
+                    <button
+                      className="stamp-clear"
+                      title="Delete the saved scan from this browser"
+                      onClick={async () => {
+                        await clearScan();
+                        setJobs([]);
+                        setNewIds(new Set());
+                        setScannedAt(null);
+                        setRestored(false);
+                        setErrors([]);
+                      }}
+                    >
+                      clear
+                    </button>
+                  )}
+                </span>
+              )}
             </div>
 
             {!jobs.length && !scanning && (
@@ -997,9 +1270,31 @@ export default function App() {
                         <p className="ai-reason">{j.ai.reason}</p>
                       )}
                       <div className="job-meta">
+                        {newIds.has(j.id) && <span className="tag-new">New</span>}
                         {j.location && <span>{j.location}</span>}
                         {j.remote && <span className="tag-remote">Remote</span>}
                         {j.postedAt && <span>{timeAgo(j.postedAt)}</span>}
+                        <span className="tag-cat">{j.category}</span>
+                        {j.seniority !== "mid" && (
+                          <span className="tag-cat">{j.seniorityLabel}</span>
+                        )}
+                        {j.reqYears != null ? (
+                          <span
+                            className="tag-yrs"
+                            title="Years of experience the description asks for"
+                          >
+                            {j.reqYears}+ yrs
+                          </span>
+                        ) : (
+                          j.effYears != null && (
+                            <span
+                              className="tag-yrs tag-yrs-inferred"
+                              title="No years stated — inferred from the title's seniority"
+                            >
+                              ~{j.effYears} yrs
+                            </span>
+                          )
+                        )}
                       </div>
                     </div>
                     <div className="job-right">
